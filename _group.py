@@ -1,0 +1,634 @@
+"""
+_Group: in-memory group for Tractor model fitting.
+
+Each group contains one or more nearby sources that are fit simultaneously.
+Supports single-band (model selection) and multi-band (forced photometry).
+"""
+
+import os
+import copy
+import time
+import logging
+import numpy as np
+from collections import OrderedDict
+
+import astropy.units as u
+from tractor import (Image, Tractor, FluxesPhotoCal, ConstantSky,
+                     EllipseESoft, Fluxes)
+from tractor.galaxy import ExpGalaxy, DevGalaxy, FixedCompositeGalaxy, SoftenedFracDev
+from tractor.pointsource import PointSource
+from tractor.constrained_optimizer import ConstrainedOptimizer as TractorOptimizer
+from tractor.wcs import RaDecPos
+
+from scipy.ndimage import binary_dilation
+from .utils import SimpleGalaxy, read_wcs, set_priors, create_circular_mask
+
+
+class _Group:
+    """
+    Fits one group of nearby sources using Tractor.
+
+    Parameters
+    ----------
+    group_id : int
+    band_data : dict
+        ``{band_name: {'sci': array, 'wht': array, 'psf': psf_model, 'zeropoint': float}}``
+        All bands share the same pixel grid / WCS.
+    detection_band : str
+        Band used for source detection and model-type selection.
+        Must be a key in ``band_data``.
+    msk : 2-D bool array
+        Base mask for this cutout (True = bad pixel / outside image).
+    catalog_subset : astropy.table.Table
+        Detection catalog rows for sources in this group.
+    segmap_local : dict  {source_id: (y_arr, x_arr)}
+    groupmap_local : dict  {group_id: (y_arr, x_arr)}
+    wcs : astropy WCS  (local cutout WCS)
+    pixel_scales : astropy Quantity array
+    config : Config
+    origin : (x_col_min, y_row_min)  0-indexed in the full image
+    """
+
+    def __init__(self, group_id, band_data, detection_band,
+                 msk, catalog_subset, segmap_local, groupmap_local,
+                 wcs, pixel_scales, config, origin):
+
+        self.group_id = group_id
+        self.type = 'group'
+        self.logger = logging.getLogger(f'slimfarmer.group_{group_id}')
+        self.rejected = False
+
+        self.config = config
+        self.detection_band = detection_band
+        self.bands = list(band_data.keys())
+        self.pixel_scales = pixel_scales
+        self.origin = origin
+
+        # Base mask (group boundary + bad pixels from detection band)
+        self.msk = msk.astype(bool)
+
+        # Per-band image data (cleaned)
+        self.band_data = {}
+        for band, bd in band_data.items():
+            sci = bd['sci'].copy().astype(np.float64)
+            wht = bd['wht'].copy().astype(np.float64)
+            bad = ~np.isfinite(sci)
+            sci[bad] = 0.
+            wht[~np.isfinite(wht) | (wht < 0) | bad] = 0.
+            self.band_data[band] = {
+                'sci': sci,
+                'wht': wht,
+                'psf': bd['psf'],
+                'zeropoint': bd['zeropoint'],
+            }
+
+        # Segmap / groupmap in local pixel coordinates
+        self.segmap_local = segmap_local
+        self.groupmap_local = groupmap_local
+
+        # Catalog
+        self.catalog = catalog_subset
+        self.catalog_band = 'detection'
+        self.catalog_imgtype = 'science'
+        self.source_ids = np.array(catalog_subset['id'])
+        self.catalogs = {self.catalog_band: {self.catalog_imgtype: catalog_subset}}
+
+        # WCS
+        self.wcs = wcs
+
+        # Fitting state
+        self.images = OrderedDict()
+        self.engine = None
+        self.model_catalog = OrderedDict()
+        self.model_tracker = OrderedDict()
+        self.stage = None
+        self.solved = None
+        self.variance = None
+        self.existing_model_catalog = None
+
+    # ── WCS ──────────────────────────────────────────────────────────────────
+
+    def _make_tractor_wcs(self):
+        """Build Tractor WCS with correct x0/y0 offset (mirrors the_farmer logic)."""
+        tractor_wcs = read_wcs(self.wcs)
+        try:
+            src = self.catalog[0]
+            ok, raw_x, raw_y = tractor_wcs.wcs.radec2pixelxy(
+                float(src['ra']), float(src['dec']))
+            cat_local_x = float(src['x']) - float(self.origin[0])
+            cat_local_y = float(src['y']) - float(self.origin[1])
+            x0 = (raw_x - 1) - cat_local_x
+            y0 = (raw_y - 1) - cat_local_y
+            tractor_wcs.setX0Y0(x0, y0)
+        except Exception as e:
+            self.logger.debug(f'Could not set WCS x0/y0: {e}')
+        return tractor_wcs
+
+    # ── Image staging ────────────────────────────────────────────────────────
+
+    def _stage_images(self, bands=None):
+        """
+        Create Tractor Image objects for the specified bands.
+
+        Parameters
+        ----------
+        bands : list of str, optional
+            Bands to stage. Default: all bands in ``self.band_data``.
+            The detection band should appear first so index-0 chi stats
+            are computed for it during model selection.
+        """
+        if bands is None:
+            bands = self.bands
+        self.images = OrderedDict()
+        tractor_wcs = self._make_tractor_wcs()
+
+        for band in bands:
+            if band not in self.band_data:
+                continue
+            bd = self.band_data[band]
+            data = bd['sci'].copy()
+            weight = bd['wht'].copy()
+            masked = self.msk.astype(np.float32)
+
+            # Zero-out pixels outside this group's fitting footprint.
+            # The fitting footprint is the groupmap dilated by fit_dilation_radius,
+            # which is larger than the grouping dilation to capture profile wings.
+            if self.group_id in self.groupmap_local:
+                gy, gx = self.groupmap_local[self.group_id]
+                fit_mask = np.zeros(masked.shape, dtype=bool)
+                fit_mask[gy, gx] = True
+                pscl = self.pixel_scales[0].to(u.arcsec).value
+                fit_r_px = round(self.config.fit_dilation_radius.to(u.arcsec).value / pscl)
+                if fit_r_px > 0:
+                    struct = create_circular_mask(2 * fit_r_px, 2 * fit_r_px, radius=fit_r_px)
+                    fit_mask = binary_dilation(fit_mask, structure=struct)
+                masked[~fit_mask] = 1.
+
+            weight[~np.isfinite(data) | (masked == 1) | ~np.isfinite(masked)] = 0.
+            data[~np.isfinite(data)] = 0.
+            weight[~np.isfinite(weight)] = 0.
+
+            if weight.sum() == 0:
+                self.logger.debug(f'All weight pixels zero for band {band} — skipping.')
+                continue
+
+            self.images[band] = Image(
+                data=data,
+                invvar=weight,
+                psf=bd['psf'],
+                wcs=tractor_wcs,
+                photocal=FluxesPhotoCal(band),
+                sky=ConstantSky(0),
+            )
+
+    # ── Model staging ────────────────────────────────────────────────────────
+
+    def _stage_models(self):
+        """Create initial Tractor source models from the detection catalog."""
+        staged_bands = list(self.images.keys())
+        for src in self.catalog:
+            source_id = int(src['id'])
+            if source_id not in self.model_catalog:
+                continue
+            position = RaDecPos(float(src['ra']), float(src['dec']))
+
+            # Initial flux: warm-start from previous stage if available, else aperture sum
+            qflux = 0.0
+            src_tracker = self.model_tracker.get(source_id, {})
+            for prev_s in sorted([k for k in src_tracker if isinstance(k, int)], reverse=True):
+                prev_model = src_tracker[prev_s].get('model')
+                if prev_model is not None:
+                    try:
+                        qflux = prev_model.getBrightness().getFlux(self.detection_band)
+                        break
+                    except Exception:
+                        pass
+            if qflux == 0.0 and source_id in self.segmap_local and self.detection_band in self.images:
+                sy, sx = self.segmap_local[source_id]
+                try:
+                    qflux = float(np.nansum(self.images[self.detection_band].data[sy, sx]))
+                except Exception:
+                    qflux = 0.0
+
+            # Multi-band Fluxes: detection band gets initial guess, others start at 0
+            flux = Fluxes(
+                **{b: (qflux if b == self.detection_band else 0.0) for b in staged_bands},
+                order=staged_bands,
+            )
+
+            tmpl = self.model_catalog[source_id]
+
+            # Shape: warm-start from most recent stage with same model type; else use SEP moments
+            prev_shape = None
+            for prev_s in sorted([k for k in src_tracker if isinstance(k, int)], reverse=True):
+                prev_model = src_tracker[prev_s].get('model')
+                if (prev_model is not None
+                        and hasattr(prev_model, 'shape')
+                        and type(prev_model) is type(tmpl)):
+                    try:
+                        prev_shape = copy.deepcopy(prev_model.shape)
+                        break
+                    except Exception:
+                        pass
+            if prev_shape is not None:
+                shape = prev_shape
+            else:
+                pa = 90.0 - np.rad2deg(float(src['theta']))
+                pixscl = self.pixel_scales[0].to(u.arcsec).value
+                guess_r = float(np.sqrt(src['a'] * src['b'])) * pixscl
+                shape = EllipseESoft.fromRAbPhi(max(guess_r, 0.01), float(src['b'] / src['a']), pa)
+            shape.lowers = [-5, -np.inf, -np.inf]
+            shape.uppers = [1,  np.inf,  np.inf]
+            if isinstance(tmpl, PointSource):
+                model = PointSource(position, flux)
+            elif isinstance(tmpl, SimpleGalaxy):
+                model = SimpleGalaxy(position, flux)
+            elif isinstance(tmpl, ExpGalaxy):
+                model = ExpGalaxy(position, flux, shape)
+            elif isinstance(tmpl, DevGalaxy):
+                model = DevGalaxy(position, flux, shape)
+            elif isinstance(tmpl, FixedCompositeGalaxy):
+                model = FixedCompositeGalaxy(position, flux,
+                                             SoftenedFracDev(0.5), shape, shape)
+            else:
+                model = PointSource(position, flux)
+
+            model = set_priors(model, self.model_priors_active)
+            model.variance = model.copy()
+            model.statistics = {}
+            self.model_catalog[source_id] = model
+
+    # ── Optimisation ─────────────────────────────────────────────────────────
+
+    def _optimize(self):
+        """Run the Tractor optimiser; returns True on convergence."""
+        self.engine.optimizer = TractorOptimizer()
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_out = os.dup(1);  saved_err = os.dup(2)
+        os.dup2(devnull_fd, 1); os.dup2(devnull_fd, 2)
+        try:
+            for i in range(self.config.max_steps):
+                try:
+                    dlnp, X, alpha, var = self.engine.optimize(
+                        variance=True, damping=self.config.damping)
+                except (RuntimeError, ValueError, np.linalg.LinAlgError, IndexError) as e:
+                    self.logger.debug(f'Optimisation failed step {i+1}: {e}')
+                    return False
+                if dlnp < self.config.dlnp_crit:
+                    break
+            if var is None:
+                var = np.zeros(len(self.engine.getParams()))
+            self.variance = var
+            return True
+        finally:
+            os.dup2(saved_out, 1); os.dup2(saved_err, 2)
+            os.close(devnull_fd); os.close(saved_out); os.close(saved_err)
+
+    # ── Chi image and statistics ──────────────────────────────────────────────
+
+    def _build_chi_image(self):
+        """Chi = (data - model) * sqrt(invvar) for the first staged image."""
+        if not self.images or self.engine is None:
+            return None
+        first_band = list(self.images.keys())[0]
+        model_img = self.engine.getModelImage(0)
+        chi = ((self.images[first_band].data - model_img)
+               * np.sqrt(self.images[first_band].invvar))
+        return chi
+
+    def _measure_stats(self, stage):
+        """Compute chi2 statistics per source and for the group."""
+        chi = self._build_chi_image()
+        if chi is None:
+            return
+
+        q_pc = (5, 16, 50, 84, 95)
+
+        if self.group_id in self.groupmap_local:
+            gy, gx = self.groupmap_local[self.group_id]
+            group_chi = chi[gy, gx].flatten()
+        else:
+            group_chi = chi.flatten()
+
+        group_chi2 = float(np.nansum(group_chi ** 2))
+        first_img = list(self.images.values())[0]
+        ndata = int(np.sum(first_img.invvar[gy, gx] > 0)) \
+            if self.group_id in self.groupmap_local else 0
+        try:
+            nparam = self.engine.getCatalog().numberOfParams()
+        except Exception:
+            nparam = 0
+        ndof = max(1, ndata - nparam)
+
+        self.model_tracker['group'][stage] = {
+            'chisq': group_chi2, 'rchisq': group_chi2 / ndof,
+            'ndata': ndata, 'nparam': nparam, 'ndof': ndof,
+            'total': {'rchisq': group_chi2 / ndof, 'chisq': group_chi2,
+                      'ndata': ndata, 'nparam': nparam, 'ndof': ndof},
+        }
+        for pc, v in zip(q_pc, np.nanpercentile(group_chi, q=q_pc)):
+            self.model_tracker['group'][stage][f'chi_pc{pc:02d}'] = v
+
+        for src in self.catalog:
+            sid = int(src['id'])
+            if sid not in self.segmap_local:
+                continue
+            sy, sx = self.segmap_local[sid]
+            src_chi = chi[sy, sx].flatten()
+            chi2 = float(np.nansum(src_chi ** 2))
+            ndata_s = len(sy)
+            ndof_s = max(1, ndata_s - nparam)
+            self.model_tracker[sid][stage] = {
+                'chisq': chi2, 'rchisq': chi2 / ndof_s,
+                'ndata': ndata_s, 'nparam': nparam, 'ndof': ndof_s,
+                'total': {'rchisq': chi2 / ndof_s, 'chisq': chi2},
+            }
+            for pc, v in zip(q_pc, np.nanpercentile(src_chi, q=q_pc)):
+                self.model_tracker[sid][stage][f'chi_pc{pc:02d}'] = v
+
+    # ── Tracker initialisation ────────────────────────────────────────────────
+
+    def _add_tracker(self, init_stage=0):
+        if self.stage is None:
+            self.stage = init_stage
+            self.solved = np.zeros(len(self.source_ids), dtype=bool)
+        if self.stage == init_stage:
+            self.model_tracker['group'] = {}
+        self.model_tracker['group'][self.stage] = {}
+        for src in self.catalog:
+            sid = int(src['id'])
+            if sid not in self.model_catalog:
+                self.model_catalog[sid] = PointSource(None, None)
+                self.model_tracker[sid] = {}
+            self.model_tracker[sid][self.stage] = {}
+
+    def _reset_models(self):
+        self.engine = None
+        self.stage = None
+        self.model_tracker = OrderedDict()
+        self.model_catalog = OrderedDict()
+
+    # ── Store / update models ─────────────────────────────────────────────────
+
+    def _store_models(self):
+        """Save fitted parameters back to model_catalog."""
+        cat = self.engine.getCatalog()
+        cat_var = copy.deepcopy(cat)
+        cat_var.setParams(self.variance)
+
+        for i, sid in enumerate(self.source_ids):
+            model = cat[i]
+            variance = cat_var[i]
+            model.variance = variance
+            self.model_tracker[sid][self.stage]['model'] = model
+
+            if self.solved is not None and (self.solved.all() or self.stage == 11):
+                self.model_catalog[sid] = model
+                self.model_catalog[sid].group_id = self.group_id
+                self.model_catalog[sid].statistics = self.model_tracker[sid][self.stage]
+
+    def _update_models(self):
+        """Re-stage models from existing fitted shapes; update brightness for all bands."""
+        staged_bands = list(self.images.keys())
+        for src in self.catalog:
+            sid = int(src['id'])
+            if sid not in self.existing_model_catalog:
+                # Keep PointSource from _stage_models; apply forced-phot priors
+                if sid in self.model_catalog:
+                    self.model_catalog[sid] = set_priors(
+                        self.model_catalog[sid], self.model_priors_active)
+                continue
+            existing = self.existing_model_catalog[sid]
+
+            # Build per-band flux dict; fallback to detection band for new bands
+            flux_dict = {}
+            for band in staged_bands:
+                try:
+                    fv = existing.getBrightness().getFlux(band)
+                except Exception:
+                    try:
+                        fv = existing.getBrightness().getFlux(self.detection_band)
+                    except Exception:
+                        fv = 0.0
+                flux_dict[band] = fv
+
+            flux   = Fluxes(**flux_dict, order=staged_bands)
+            filler = Fluxes(**{b: 0.0 for b in staged_bands}, order=staged_bands)
+
+            self.model_catalog[sid] = copy.deepcopy(existing)
+            self.model_catalog[sid].brightness = flux
+            self.model_catalog[sid].variance.brightness = filler
+            self.model_catalog[sid] = set_priors(self.model_catalog[sid],
+                                                  self.model_priors_active)
+
+    # ── Decision tree ─────────────────────────────────────────────────────────
+
+    def _decision_tree(self):
+        """Chi2-based model selection — ported from blob.py decide_winners_chisq_opt1."""
+        for i, sid in enumerate(self.source_ids):
+            if self.solved[i]:
+                continue
+            s = self.stage
+
+            if s == 1:
+                self.model_catalog[sid] = SimpleGalaxy(None, None)
+
+            elif s == 2:
+                # blob.py level 0: PS wins if it beats SG by margin,
+                # unless both exceed chisq_force_exp_dev (back-door for extended sources).
+                ps_chi2 = self.model_tracker[sid][1]['total']['rchisq']
+                sg_chi2 = self.model_tracker[sid][2]['total']['rchisq']
+                ps_wins = (ps_chi2 - sg_chi2) < self.config.simplegalaxy_penalty
+                force_exp_dev = (ps_chi2 > self.config.chisq_force_exp_dev and
+                                 sg_chi2 > self.config.chisq_force_exp_dev)
+                if ps_wins and not force_exp_dev:
+                    self.model_catalog[sid] = PointSource(None, None)
+                    self.solved[i] = True
+                else:
+                    self.model_catalog[sid] = ExpGalaxy(None, None, None)
+
+            elif s == 3:
+                self.model_catalog[sid] = DevGalaxy(None, None, None)
+
+            elif s == 4:
+                # blob.py level 1
+                ps_chi2  = self.model_tracker[sid][1]['total']['rchisq']
+                sg_chi2  = self.model_tracker[sid][2]['total']['rchisq']
+                exp_chi2 = self.model_tracker[sid][3]['total']['rchisq']
+                dev_chi2 = self.model_tracker[sid][4]['total']['rchisq']
+
+                exp_beats_sg = exp_chi2 < sg_chi2
+                dev_beats_sg = dev_chi2 < sg_chi2
+                similar      = abs(exp_chi2 - dev_chi2) < self.config.exp_dev_similar_thresh
+                force_comp   = (exp_chi2 > self.config.chisq_force_comp and
+                                dev_chi2 > self.config.chisq_force_comp)
+
+                # PS beats everything: go back (highest priority, overrides Exp/Dev)
+                if (ps_chi2 < sg_chi2 + self.config.simplegalaxy_penalty and
+                        ps_chi2 < exp_chi2 and ps_chi2 < dev_chi2):
+                    self.model_catalog[sid] = PointSource(None, None)
+                    self.solved[i] = True
+                # SG beats both Exp and Dev AND is itself acceptable: go back to SimpleGalaxy
+                elif (not exp_beats_sg and not dev_beats_sg and
+                        sg_chi2 + self.config.simplegalaxy_penalty < ps_chi2 and
+                        sg_chi2 < self.config.chisq_force_comp):
+                    self.model_catalog[sid] = SimpleGalaxy(None, None)
+                    self.solved[i] = True
+                # Exp clearly beats SG and Dev
+                elif exp_beats_sg and not similar and exp_chi2 < dev_chi2 and not force_comp:
+                    self.model_catalog[sid] = ExpGalaxy(None, None, None)
+                    self.solved[i] = True
+                # Dev clearly beats SG and Exp
+                elif dev_beats_sg and not similar and dev_chi2 < exp_chi2 and not force_comp:
+                    self.model_catalog[sid] = DevGalaxy(None, None, None)
+                    self.solved[i] = True
+                # Both beat SG and are similar, or both still too bad: try Composite
+                else:
+                    self.model_catalog[sid] = FixedCompositeGalaxy(None, None, None, None, None)
+
+            elif s == 5:
+                # blob.py level 2: argmin over {Exp, Dev, Comp}, tie goes to Exp
+                exp_chi2  = self.model_tracker[sid][3]['total']['rchisq']
+                dev_chi2  = self.model_tracker[sid][4]['total']['rchisq']
+                comp_chi2 = self.model_tracker[sid][5]['total']['rchisq']
+                if comp_chi2 < exp_chi2 and comp_chi2 < dev_chi2:
+                    self.model_catalog[sid] = FixedCompositeGalaxy(None, None, None, None, None)
+                elif exp_chi2 <= dev_chi2:
+                    self.model_catalog[sid] = ExpGalaxy(None, None, None)
+                else:
+                    self.model_catalog[sid] = DevGalaxy(None, None, None)
+                self.solved[i] = True
+
+    # ── Main fitting entry points ──────────────────────────────────────────────
+
+    def determine_models(self):
+        """Run model-type selection on the detection band (Stages 1–5+)."""
+        self.model_priors_active = self.config.model_priors
+        self._reset_models()
+        self._add_tracker()
+        self._stage_images(bands=[self.detection_band])
+        if not self.images:
+            return False
+        tstart = time.time()
+        while not self.solved.all():
+            self.stage += 1
+            self._add_tracker()
+            self._stage_models()
+            self.engine = Tractor(list(self.images.values()),
+                                  [self.model_catalog[sid] for sid in self.source_ids
+                                   if sid in self.model_catalog])
+            self.engine.bands = list(self.images.keys())
+            self.engine.freezeParam('images')
+            ok = self._optimize()
+            if not ok:
+                return False
+            self._measure_stats(self.stage)
+            self._store_models()
+            self._decision_tree()
+        # Final convergence pass
+        self.stage += 1
+        self._add_tracker()
+        self._stage_models()
+        self.engine = Tractor(list(self.images.values()),
+                              [self.model_catalog[sid] for sid in self.source_ids
+                               if sid in self.model_catalog])
+        self.engine.bands = list(self.images.keys())
+        self.engine.freezeParam('images')
+        ok = self._optimize()
+        if not ok:
+            return False
+        self._measure_stats(self.stage)
+        self._store_models()
+        self.logger.debug(f'Modelling done ({time.time()-tstart:.2f}s)')
+        return True
+
+    def _subtract_neighbor_contributions(self, neighboring_models):
+        """Subtract PSF-convolved neighbor model images from the staged image data."""
+        neighbor_list = [copy.deepcopy(m) for sid, m in neighboring_models.items()
+                         if sid not in self.source_ids]
+        if not neighbor_list:
+            return
+        for band, img in self.images.items():
+            temp_tractor = Tractor([img], neighbor_list)
+            temp_tractor.bands = [band]
+            temp_tractor.freezeParam('images')
+            try:
+                contrib = temp_tractor.getModelImage(0)
+                img.data = img.data - contrib
+            except Exception as e:
+                self.logger.debug(f'Neighbor subtraction failed for band {band}: {e}')
+
+    def force_models(self, neighboring_models=None):
+        """
+        Forced photometry: freeze shape parameters, re-fit flux in all bands.
+
+        Detection band is staged first so chi statistics are computed for it.
+        If neighboring_models is provided, their PSF-convolved contributions are
+        subtracted from the image data before fitting (neighbor subtraction pass).
+        """
+        self.model_priors_active = self.config.phot_priors
+        self.existing_model_catalog = copy.deepcopy(self.model_catalog)
+        if not self.existing_model_catalog:
+            return False
+        self._reset_models()
+        self._add_tracker(init_stage=10)
+        # Stage detection band first, then other bands
+        bands_ordered = ([self.detection_band]
+                         + [b for b in self.bands if b != self.detection_band])
+        self._stage_images(bands=bands_ordered)
+        if not self.images:
+            return False
+        if neighboring_models:
+            self._subtract_neighbor_contributions(neighboring_models)
+        self._stage_models()
+        self.stage = 11
+        self._add_tracker()
+        self._update_models()
+        self.engine = Tractor(list(self.images.values()),
+                              [self.model_catalog[sid] for sid in self.source_ids
+                               if sid in self.model_catalog])
+        self.engine.bands = list(self.images.keys())
+        self.engine.freezeParam('images')
+        self._measure_stats(10)
+        ok = self._optimize()
+        if not ok:
+            return False
+        self._measure_stats(self.stage)
+        self._store_models()
+        return True
+
+
+# ── Module-level helpers (must be at top level for multiprocessing pickle) ─────
+
+def _process_group(group):
+    """Determine models + force photometry for a group; return serialisable result."""
+    tstart = time.time()
+    if not group.rejected:
+        ok = group.determine_models()
+        if ok:
+            group.force_models()
+    elapsed = time.time() - tstart
+    for sid in group.source_ids:
+        if sid in group.model_tracker:
+            stages = [k for k in group.model_tracker[sid] if isinstance(k, int)]
+            if stages:
+                group.model_tracker[sid][max(stages)]['group_time'] = elapsed
+    return group.group_id, group.model_catalog.copy(), group.model_tracker.copy()
+
+
+def _process_group_second_pass(args):
+    """Second-pass forced photometry with neighbor model subtraction."""
+    group, neighboring_models, pass1_models = args
+    if group.rejected or not pass1_models:
+        return group.group_id, group.model_catalog.copy(), group.model_tracker.copy()
+    # Restore pass-1 model_catalog so force_models can warm-start from it
+    group.model_catalog = copy.deepcopy(pass1_models)
+    tstart = time.time()
+    ok = group.force_models(neighboring_models=neighboring_models)
+    elapsed = time.time() - tstart
+    for sid in group.source_ids:
+        if sid in group.model_tracker:
+            stages = [k for k in group.model_tracker[sid] if isinstance(k, int)]
+            if stages:
+                group.model_tracker[sid][max(stages)]['group_time'] = elapsed
+    return group.group_id, group.model_catalog.copy(), group.model_tracker.copy()

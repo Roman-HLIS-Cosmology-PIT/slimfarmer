@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: slimfarmer
+Version: 1.0.0
+Summary: Streamlined single-band/multi band Tractor model photometry
+Requires-Python: >=3.9
+Requires-Dist: numpy
+Requires-Dist: astropy>=5.0
+Requires-Dist: scipy
+Requires-Dist: sep
+Requires-Dist: tqdm
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

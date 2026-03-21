@@ -1,0 +1,5 @@
+numpy
+astropy>=5.0
+scipy
+sep
+tqdm

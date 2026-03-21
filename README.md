@@ -3,6 +3,27 @@ Simpler version of the farmer which combines SEP for detection and Tractor for p
 
 Detection (SEP) → grouping → model selection → forced photometry, with optional neighbor subtraction for crowded fields.
 
+  1. Detection (SEP) — run once, not iterative
+
+  SEP (Source Extractor in Python) is called a single time to produce a source catalog and segmentation map. There is no iterative detection, no source subtraction loop, and no re-detection. The output is a fixed list of positions and a per-pixel segmentation map assigning each
+  detected pixel to a source.
+
+  2. Grouping
+
+  Sources whose segmaps overlap (after dilation by dilation_radius = 0.07") are placed into the same group and co-fitted simultaneously. This prevents Tractor from ignoring neighbors when fitting a blended source. A separate, larger dilation (fit_dilation_radius = 0.24") defines the
+  pixel footprint Tractor actually sees — large enough to capture profile wings without merging distant sources into oversized groups.
+
+  3. Model selection
+
+  For each group, Tractor tries a sequence of increasingly complex models: PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy. It selects the simplest model whose reduced chi² is acceptable.
+
+  4. Forced photometry
+
+  With morphology fixed to the best model, Tractor re-fits only the flux of every source. Optionally (neighbor_subtraction = True), nearby group models are subtracted from the data before the final flux measurement to reduce cross-contamination.
+
+
+
+
 ## Installation
 
 ```bash

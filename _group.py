@@ -18,6 +18,8 @@ from tractor import (Image, Tractor, FluxesPhotoCal, ConstantSky,
 from tractor.galaxy import ExpGalaxy, DevGalaxy, FixedCompositeGalaxy, SoftenedFracDev
 from tractor.pointsource import PointSource
 from tractor.constrained_optimizer import ConstrainedOptimizer as TractorOptimizer
+#from tractor.gpu_optimizer import GpuOptimizer as TractorOptimizer
+#from tractor.dense_optimizer import ConstrainedDenseOptimizer as TractorOptimizer
 from tractor.wcs import RaDecPos
 
 from scipy.ndimage import binary_dilation
@@ -75,10 +77,15 @@ class _Group:
             bad = ~np.isfinite(sci)
             sci[bad] = 0.
             wht[~np.isfinite(wht) | (wht < 0) | bad] = 0.
+            eff_gain = bd.get('eff_gain')
+            if eff_gain is not None:
+                eff_gain = eff_gain.copy().astype(np.float64)
+                eff_gain[~np.isfinite(eff_gain) | (eff_gain <= 0)] = np.inf
             self.band_data[band] = {
-                'sci': sci,
-                'wht': wht,
-                'psf': bd['psf'],
+                'sci':      sci,
+                'wht':      wht,
+                'eff_gain': eff_gain,
+                'psf':      bd['psf'],
                 'zeropoint': bd['zeropoint'],
             }
 
@@ -180,6 +187,8 @@ class _Group:
                 photocal=FluxesPhotoCal(band),
                 sky=ConstantSky(0),
             )
+            # Store background-only invvar for model-based Poisson update
+            self.band_data[band]['invvar_bg'] = weight.copy()
 
     # ── Model staging ────────────────────────────────────────────────────────
 
@@ -192,27 +201,25 @@ class _Group:
                 continue
             position = RaDecPos(float(src['ra']), float(src['dec']))
 
-            # Initial flux: warm-start from previous stage if available, else aperture sum
-            qflux = 0.0
+            # Initial flux: primary band gets aperture sum; all others start at 0.
+            # Starting non-primary bands at 0 ensures background-only invvar on the
+            # first optimisation step, giving an optimal matched-filter estimate and
+            # avoiding Poisson-overshoot bias from noisy warm-started fluxes.
+            # Primary = detection band if staged, else first staged band.
+            primary_band = self.detection_band if self.detection_band in staged_bands else staged_bands[0]
             src_tracker = self.model_tracker.get(source_id, {})
-            for prev_s in sorted([k for k in src_tracker if isinstance(k, int)], reverse=True):
-                prev_model = src_tracker[prev_s].get('model')
-                if prev_model is not None:
-                    try:
-                        qflux = prev_model.getBrightness().getFlux(self.detection_band)
-                        break
-                    except Exception:
-                        pass
-            if qflux == 0.0 and source_id in self.segmap_local and self.detection_band in self.images:
+            qflux = 0.0
+            ref_band = self.detection_band if self.detection_band in staged_bands else (
+                staged_bands[0] if staged_bands else None)
+            if source_id in self.segmap_local and ref_band is not None:
                 sy, sx = self.segmap_local[source_id]
                 try:
-                    qflux = float(np.nansum(self.images[self.detection_band].data[sy, sx]))
+                    qflux = float(np.nansum(self.images[ref_band].data[sy, sx]))
                 except Exception:
                     qflux = 0.0
 
-            # Multi-band Fluxes: detection band gets initial guess, others start at 0
             flux = Fluxes(
-                **{b: (qflux if b == self.detection_band else 0.0) for b in staged_bands},
+                **{b: (qflux if b == primary_band else 0.0) for b in staged_bands},
                 order=staged_bands,
             )
 
@@ -233,12 +240,22 @@ class _Group:
             if prev_shape is not None:
                 shape = prev_shape
             else:
-                pa = 90.0 - np.rad2deg(float(src['theta']))
+                theta_val = float(src['theta'])
+                if not np.isfinite(theta_val):
+                    theta_val = 0.0
+                pa = 90.0 - np.rad2deg(theta_val)
                 pixscl = self.pixel_scales[0].to(u.arcsec).value
-                guess_r = float(np.sqrt(src['a'] * src['b'])) * pixscl
-                shape = EllipseESoft.fromRAbPhi(max(guess_r, 0.01), float(src['b'] / src['a']), pa)
-            shape.lowers = [-5, -np.inf, -np.inf]
-            shape.uppers = [1,  np.inf,  np.inf]
+                a_pix = float(src['a'])
+                b_pix = float(src['b'])
+                if not np.isfinite(a_pix) or a_pix <= 0:
+                    a_pix = 1.0
+                if not np.isfinite(b_pix) or b_pix <= 0:
+                    b_pix = a_pix
+                guess_r = np.sqrt(a_pix * b_pix) * pixscl
+                ba = min(b_pix / a_pix, 1.0)
+                shape = EllipseESoft.fromRAbPhi(max(guess_r, 0.01), ba, pa)
+            shape.lowers = [-3, -10.0, -10.0]
+            shape.uppers = [1,   10.0,  10.0]
             if isinstance(tmpl, PointSource):
                 model = PointSource(position, flux)
             elif isinstance(tmpl, SimpleGalaxy):
@@ -260,20 +277,38 @@ class _Group:
 
     # ── Optimisation ─────────────────────────────────────────────────────────
 
+    def _update_invvar_with_model(self):
+        """
+        Update each Tractor image's invvar to include model-based Poisson noise.
+
+        invvar = 1 / (bg_var + model_flux / eff_gain)
+
+        where bg_var = 1 / invvar_bg (background-only variance) and
+        eff_gain converts model flux to Poisson variance.  Called before each
+        optimisation step so the noise model tracks the current best-fit model.
+        If eff_gain is not available for a band, the invvar is left unchanged.
+        """
+        for i, (band, img) in enumerate(self.images.items()):
+            bd = self.band_data[band]
+            if bd.get('eff_gain') is None or 'invvar_bg' not in bd:
+                continue
+            model_img = self.engine.getModelImage(i)
+            bg_var = np.where(bd['invvar_bg'] > 0, 1.0 / bd['invvar_bg'], np.inf)
+            poisson_var = np.maximum(model_img, 0.) / bd['eff_gain']
+            total_var = bg_var + poisson_var
+            img.setInvvar(np.where(total_var > 0, 1.0 / total_var, 0.))
+
     def _optimize(self):
         """Run the Tractor optimiser; returns True on convergence."""
+        import io, sys
         self.engine.optimizer = TractorOptimizer()
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        saved_out = os.dup(1);  saved_err = os.dup(2)
-        os.dup2(devnull_fd, 1); os.dup2(devnull_fd, 2)
+        _saved_stdout, _saved_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = io.StringIO()
         try:
             for i in range(self.config.max_steps):
-                try:
-                    dlnp, X, alpha, var = self.engine.optimize(
-                        variance=True, damping=self.config.damping)
-                except (RuntimeError, ValueError, np.linalg.LinAlgError, IndexError) as e:
-                    self.logger.debug(f'Optimisation failed step {i+1}: {e}')
-                    return False
+                self._update_invvar_with_model()
+                dlnp, X, alpha, var = self.engine.optimize(
+                    variance=True, damping=self.config.damping, priors=True)
                 if dlnp < self.config.dlnp_crit:
                     break
             if var is None:
@@ -281,8 +316,7 @@ class _Group:
             self.variance = var
             return True
         finally:
-            os.dup2(saved_out, 1); os.dup2(saved_err, 2)
-            os.close(devnull_fd); os.close(saved_out); os.close(saved_err)
+            sys.stdout, sys.stderr = _saved_stdout, _saved_stderr
 
     # ── Chi image and statistics ──────────────────────────────────────────────
 
@@ -406,9 +440,9 @@ class _Group:
                 try:
                     fv = existing.getBrightness().getFlux(band)
                 except Exception:
-                    try:
-                        fv = existing.getBrightness().getFlux(self.detection_band)
-                    except Exception:
+                #    try:
+                #        fv = existing.getBrightness().getFlux(self.detection_band)
+                #    except Exception:
                         fv = 0.0
                 flux_dict[band] = fv
 
@@ -502,11 +536,13 @@ class _Group:
     # ── Main fitting entry points ──────────────────────────────────────────────
 
     def determine_models(self):
-        """Run model-type selection on the detection band (Stages 1–5+)."""
+        """Run model-type selection on the configured modeling bands (Stages 1–5+)."""
         self.model_priors_active = self.config.model_priors
         self._reset_models()
         self._add_tracker()
-        self._stage_images(bands=[self.detection_band])
+        bands_ordered = ([self.detection_band]
+                         + [b for b in self.bands if b != self.detection_band])
+        self._stage_images(bands=bands_ordered)
         if not self.images:
             return False
         tstart = time.time()

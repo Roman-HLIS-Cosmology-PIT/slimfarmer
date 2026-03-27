@@ -91,7 +91,7 @@ def diagnose_source(source_id, img, truth, obs_to_nm, truth_to_nm, oversamplepix
         model_name = type(final).__name__
         if hasattr(final, 'shape'):
             try:
-                reff = 10 ** float(final.shape.logre)
+                reff = np.exp(float(final.shape.logre))
             except Exception:
                 pass
         t = group.model_tracker.get(source_id, {}).get(11, {})
@@ -240,7 +240,7 @@ def _plot_source(source_id, img, sci, wht, cx, cy, dist_full,
                     label=f'SEP a={float(row["a"])*oversamplepix:.2f}"')
     if final is not None and hasattr(final, 'shape'):
         try:
-            re = 10 ** float(final.shape.logre)
+            re = np.exp(float(final.shape.logre))
             axes[4].axvline(x=re, color='red', ls='--', lw=1, label=f'reff={re:.3f}"')
         except Exception:
             pass

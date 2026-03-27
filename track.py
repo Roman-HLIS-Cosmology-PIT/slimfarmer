@@ -47,12 +47,10 @@ def _get_flux_converters(science_path, band):
                     if hh.data is not None and hh.data.ndim >= 2), 0)
         oversamplepix = abs(h[ext].header['CDELT2']) * 3600.  # arcsec/px
 
-    pix_size = 0.11   # native Roman pixel scale (arcsec)
-    gain     = 1.458  # DN → e-
 
     def obs_to_nm(flux_imcom):
         """IMCOM image DN → nanomaggy."""
-        fn  = float(flux_imcom) * gain / (pix_size / oversamplepix) ** 2
+        fn  = float(flux_imcom)# * gain / (pix_size / oversamplepix) ** 2
         mag = -2.5 * np.log10(abs(fn) + 1e-30) + zp_gs + 2.5 * np.log10(ca)
         return 10 ** ((mag - 22.5) / -2.5)
 
@@ -358,7 +356,7 @@ def _plot_track(group, source_id, img, band, truth_matches=None, out=None):
 
 
 def track_source(source_id, science_path, weight_path, psf_path,
-                 band, zeropoint, config=None,
+                 band, zeropoint, eff_gain_path=None, config=None,
                  truth_pos_path=None, truth_radius_arcsec=10.0,
                  truth_flux_path=None, truth_flux_col=None,
                  plot=False, plot_out=None):
@@ -374,6 +372,7 @@ def track_source(source_id, science_path, weight_path, psf_path,
     psf_path             : str   — FITS file paths
     band                 : str   — e.g. 'F158'
     zeropoint            : float
+    eff_gain_path        : str or None — effective gain map from prepare_images_from_cpr
     config               : Config or None
     truth_pos_path       : str or None
         Parquet with columns galaxy_id, ra, dec.
@@ -399,9 +398,10 @@ def track_source(source_id, science_path, weight_path, psf_path,
     obs_to_nm, truth_to_nm = _get_flux_converters(science_path, band)
 
     img = FarmerImage(
-        bands={band: {'science': science_path,
-                      'weight':  weight_path,
-                      'psf':     psf_path,
+        bands={band: {'science':  science_path,
+                      'weight':   weight_path,
+                      'eff_gain': eff_gain_path,
+                      'psf':      psf_path,
                       'zeropoint': zeropoint}},
         detection_band=band,
         config=config,
@@ -497,7 +497,7 @@ def track_source(source_id, science_path, weight_path, psf_path,
             pnames = shape.getParamNames()
             pvals  = shape.getParams()
             pstr   = '  '.join(f'{n}={float(v):.3f}' for n, v in zip(pnames, pvals))
-            print(f'Shape: {pstr}  reff={10**float(shape.logre):.3f}"')
+            print(f'Shape: {pstr}  reff={np.exp(float(shape.logre)):.3f}"')
         except Exception:
             pass
 

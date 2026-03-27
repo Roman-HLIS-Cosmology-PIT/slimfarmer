@@ -18,7 +18,7 @@ from astropy.stats import sigma_clipped_stats
 from astropy.wcs.utils import proj_plane_pixel_scales
 from collections import OrderedDict
 
-from tractor import PixelizedPSF, PixelizedPsfEx
+from tractor import PixelizedPSF, PixelizedPsfEx, HybridPixelizedPSF
 import tqdm as _tqdm
 
 try:
@@ -92,6 +92,15 @@ class FarmerImage:
                 wht = np.where(rms > 0, np.ones_like(sci) / rms ** 2, 0.)
                 self.logger.info(f'  {band}: no weight — generated from clipped RMS = {rms:.4g}')
 
+            eff_gain_path = bconf.get('eff_gain')
+            if eff_gain_path is not None:
+                with fits.open(eff_gain_path) as hdul:
+                    ext = next((i for i, h in enumerate(hdul)
+                                if h.data is not None and h.data.ndim >= 2), 0)
+                    eff_gain = hdul[ext].data.astype(np.float64)
+            else:
+                eff_gain = None
+
             psf_path = bconf['psf']
             if psf_path.endswith('.psf'):
                 try:
@@ -99,11 +108,11 @@ class FarmerImage:
                 except Exception:
                     img = fits.getdata(psf_path).astype(np.float32)
                     img[~np.isfinite(img) | (img < 1e-31)] = 1e-31
-                    psf_model = PixelizedPSF(img)
+                    psf_model = HybridPixelizedPSF(PixelizedPSF(img))
             else:
                 img = fits.getdata(psf_path).astype(np.float32)
                 img[~np.isfinite(img) | (img < 1e-31)] = 1e-31
-                psf_model = PixelizedPSF(img)
+                psf_model = HybridPixelizedPSF(PixelizedPSF(img))
             if self.config.renorm_psf is not None:
                 psf_model.img *= self.config.renorm_psf / float(np.nansum(psf_model.img))
 
@@ -114,6 +123,7 @@ class FarmerImage:
             self.band_config[band] = {
                 'science':   sci,
                 'weight':    wht,
+                'eff_gain':  eff_gain,
                 'mask':      (wht <= 0) | ~np.isfinite(sci),
                 'psf_model': psf_model,
                 'zeropoint': bconf['zeropoint'],
@@ -248,10 +258,15 @@ class FarmerImage:
         except (ValueError, IndexError):
             return _rejected()
 
-        origin = det_sci_cut.origin_original  # (x_col_min, y_row_min) 0-indexed
         local_h, local_w = det_sci_cut.data.shape
-        oy = int(origin[1])
-        ox = int(origin[0])
+        # Use center-based offset instead of origin_original: when the cutout extends
+        # beyond the image boundary (mode='partial'), origin_original gives the first
+        # *valid* pixel in the original image, but the padded array's local y=0 may
+        # correspond to a negative row in the original image.  The center relationship
+        # is always correct regardless of boundary padding.
+        ox = int(round(det_sci_cut.center_original[0] - det_sci_cut.center_cutout[0]))
+        oy = int(round(det_sci_cut.center_original[1] - det_sci_cut.center_cutout[1]))
+        origin = (ox, oy)
 
         band_data = {}
         for band, bc in self.band_config.items():
@@ -262,10 +277,19 @@ class FarmerImage:
                                    wcs=self.wcs, mode='partial', fill_value=0., copy=True)
             except (ValueError, IndexError):
                 return _rejected()
+            eff_gain_cut = None
+            if bc['eff_gain'] is not None:
+                try:
+                    eff_gain_cut = Cutout2D(bc['eff_gain'], position, buffsize,
+                                            wcs=self.wcs, mode='partial',
+                                            fill_value=0., copy=True).data
+                except (ValueError, IndexError):
+                    pass
             band_data[band] = {
-                'sci': sci_cut.data,
-                'wht': wht_cut.data,
-                'psf': bc['psf_model'],
+                'sci':      sci_cut.data,
+                'wht':      wht_cut.data,
+                'eff_gain': eff_gain_cut,
+                'psf':      bc['psf_model'],
                 'zeropoint': bc['zeropoint'],
             }
 
@@ -500,6 +524,43 @@ class FarmerImage:
         self.logger.info(f'Catalog written → {path}  ({len(cat)} rows)')
         return cat
 
+    def build_model_image(self, band=None):
+        """
+        Render the full-image model from the fitted model_catalog.
+
+        Parameters
+        ----------
+        band : str, optional
+            Band to render. Defaults to detection_band.
+
+        Returns
+        -------
+        model_img : 2-D ndarray, same shape as the science image.
+        """
+        import copy
+        from tractor import Image as TImage, Tractor as TTractor, FluxesPhotoCal, ConstantSky
+        from .utils import read_wcs
+
+        if band is None:
+            band = self.detection_band
+        bc = self.band_config[band]
+
+        sources = [copy.deepcopy(m) for m in self.model_catalog.values()
+                   if hasattr(m, 'pos')]
+        if not sources:
+            self.logger.warning('No fitted sources in model_catalog — returning zero model.')
+            return np.zeros_like(bc['science'])
+
+        timg = TImage(
+            data=bc['science'].copy(),
+            invvar=bc['weight'].copy(),
+            psf=bc['psf_model'],
+            wcs=read_wcs(self.wcs),
+            photocal=FluxesPhotoCal(band),
+            sky=ConstantSky(0),
+        )
+        return TTractor([timg], sources).getModelImage(0)
+
 
 # ── Module-level helper for pathos lazy generator ─────────────────────────────
 
@@ -510,20 +571,23 @@ def _spawn_and_process(farmer, gid):
 # ── Convenience top-level function ────────────────────────────────────────────
 
 def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
-                   weight_path=None, bands=None, detection_band=None,
-                   output_path=None, group_ids=None, config=None, **config_kwargs):
+                   weight_path=None, eff_gain_path=None, bands=None,
+                   detection_band=None, output_path=None, group_ids=None,
+                   config=None, **config_kwargs):
     """
     One-call photometry pipeline.  Supports both single-band and multi-band modes.
 
     Single-band (backward-compatible)
     ----------------------------------
-    run_photometry(science_path, psf_path, band, zeropoint, weight_path=..., ...)
+    run_photometry(science_path, psf_path, band, zeropoint, weight_path=...,
+                   eff_gain_path=..., ...)
 
     Multi-band
     ----------
     run_photometry(
         bands={
-            'F158': {'science': path, 'psf': path, 'zeropoint': 26.5, 'weight': path},
+            'F158': {'science': path, 'psf': path, 'zeropoint': 26.5,
+                     'weight': path, 'eff_gain': path},
             'F106': {'science': path, 'psf': path, 'zeropoint': 26.3},
         },
         detection_band='F158',
@@ -539,7 +603,8 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
                 "Provide either a 'bands' dict or all of: "
                 "science_path, psf_path, band, zeropoint")
         bands = {band: {'science': science_path, 'psf': psf_path,
-                        'zeropoint': zeropoint, 'weight': weight_path}}
+                        'zeropoint': zeropoint, 'weight': weight_path,
+                        'eff_gain': eff_gain_path}}
 
     if config is None:
         config = Config(**config_kwargs)
@@ -556,4 +621,17 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
     cat = img.build_catalog()
     if output_path is not None:
         cat.write(output_path, overwrite=True)
+    if config.save_model_image:
+        hdr = img.wcs.to_header()
+        base = output_path.rsplit('.fits', 1)[0] if output_path else 'slimfarmer_output'
+        logger = logging.getLogger('slimfarmer')
+        for band in img.band_config:
+            model_img = img.build_model_image(band=band)
+            sci = img.band_config[band]['science']
+            residual = (sci - model_img).astype(np.float32)
+            suffix = f'_{band}' if len(img.band_config) > 1 else ''
+            fits.writeto(base + suffix + '_model.fits',    model_img.astype(np.float32), header=hdr, overwrite=True)
+            fits.writeto(base + suffix + '_residual.fits', residual,                     header=hdr, overwrite=True)
+            logger.info(f'Model    → {base}{suffix}_model.fits')
+            logger.info(f'Residual → {base}{suffix}_residual.fits')
     return cat

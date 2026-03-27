@@ -14,6 +14,9 @@ from tractor.galaxy import ExpGalaxy, SoftenedFracDev
 from tractor import PointSource, DevGalaxy, FixedCompositeGalaxy, Fluxes
 from astrometry.util.util import Tan
 from tractor import ConstantFitsWcs
+from astropy.wcs import WCS
+from astropy.nddata import Cutout2D
+
 
 
 class SimpleGalaxy(ExpGalaxy):
@@ -178,8 +181,11 @@ def set_priors(model, priors):
                 model[idx].freezeAllParams()
             elif rule != 'none':
                 sigma = rule.to(u.deg).value
-                model[idx].addGaussianPrior('ra', mu=model[idx][0], sigma=sigma)
-                model[idx].addGaussianPrior('dec', mu=model[idx][1], sigma=sigma)
+                ra_val = float(model[idx][0])
+                dec_val = float(model[idx][1])
+                if np.isfinite(ra_val) and np.isfinite(dec_val):
+                    model[idx].addGaussianPrior('ra', mu=ra_val, sigma=sigma)
+                    model[idx].addGaussianPrior('dec', mu=dec_val, sigma=sigma)
         elif name == 'fracDev':
             if priors.get('fracDev', 'none') in ('fix', 'freeze'):
                 model.freezeParam(idx)
@@ -188,8 +194,16 @@ def set_priors(model, priors):
                 for i, _ in enumerate(model[idx].getParamNames()):
                     if i != 0:
                         model[idx].freezeParam(i)
-            if priors.get('reff', 'none') in ('fix', 'freeze'):
+            reff_rule = priors.get('reff', 'none')
+            if reff_rule in ('fix', 'freeze'):
                 model[idx].freezeParam(0)
+            elif reff_rule != 'none':
+                sigma_arcsec = reff_rule.to(u.arcsec).value
+                logre_val = float(model[idx].logre)
+                if np.isfinite(logre_val):
+                    reff_current = max(np.exp(logre_val), 1e-3)
+                    sigma_logre = sigma_arcsec / reff_current
+                    model[idx].addGaussianPrior('logre', mu=logre_val, sigma=sigma_logre)
     return model
 
 
@@ -256,9 +270,18 @@ def prepare_images_from_cpr(cpr_path, work_dir,
                             psf_fwhm_arcsec=None,
                             sci_name='roman_image.fits',
                             wht_name='roman_weight.fits',
-                            psf_name='PSF_F158.fits'):
+                            psf_name='PSF_F158.fits',
+                            eff_gain_name='roman_eff_gain.fits',
+                            pix_size= 0.11,
+                            gain = 1.458,
+                            exptime = 107.52398,
+                            overwrite=True,
+                            truth=False,
+                            positionsize=None, realization=False
+                            ):
     """
-    Extract science image, weight map, and PSF stamp from an IMCOM CPR FITS file.
+    Extract science image, weight map, PSF stamp, and effective gain map from
+    an IMCOM CPR FITS file.
 
     The CPR format stores the IMCOM output as a compressed multi-layer cube:
       HDU 0, layer  0 : science image (background-subtracted, DN/px/s)
@@ -267,11 +290,14 @@ def prepare_images_from_cpr(cpr_path, work_dir,
       HDU 6           : Sigma map (correlated noise amplitude, in log10-bels)
       HDU 8           : Neff map  (effective coverage, in log10-bels)
 
-    Variance = correlated_term + Poisson_term:
-      correlated_term = (sum(noise_layer²) / sum(Sigma)) * Sigma
-      Poisson_term    = max(signal_map, 0) / 107.52398 / Neff
+    Weight map = 1 / correlated_variance (background noise only; no source shot
+    noise).  Source shot noise is intentionally excluded here so that it can be
+    estimated from the fitted model during photometry.
 
-    Weight map = 1 / variance (inverse variance, as expected by Tractor).
+    Effective gain map (eff_gain): converts a model flux value to its expected
+    Poisson variance as  poisson_var = model_flux / eff_gain.
+    In scaled image units: eff_gain = 107.52398 * Neff / scaling_factor,
+    where scaling_factor = gain / (pix_size / native_pix_scale)².
 
     PSF is approximated as a 2-D Gaussian with the Roman H158 effective FWHM.
     The stamp is normalised to sum = 1.
@@ -283,13 +309,27 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     psf_fwhm_arcsec : float — Gaussian PSF FWHM in arcsec.
                               Default: Roman H158 effective PSF FWHM (~0.240").
     sci_name        : str   — output filename for science image
-    wht_name        : str   — output filename for weight map
+    wht_name        : str   — output filename for weight map (background only)
     psf_name        : str   — output filename for PSF stamp
+    eff_gain_name   : str   — output filename for effective gain map
+    overwrite       : bool  — if False, skip calculation when all output files exist
 
     Returns
     -------
-    sci_path, wht_path, psf_path : str
+    sci_path, wht_path, psf_path, eff_gain_path : str
     """
+    os.makedirs(work_dir, exist_ok=True)
+
+    sci_path      = os.path.join(work_dir, sci_name)
+    wht_path      = os.path.join(work_dir, wht_name)
+    psf_path      = os.path.join(work_dir, psf_name)
+    eff_gain_path = os.path.join(work_dir, eff_gain_name)
+
+    if not overwrite and all(os.path.exists(p) for p in (sci_path, wht_path, psf_path, eff_gain_path)):
+        logger = logging.getLogger('slimfarmer')
+        logger.info(f'Skipping CPR preparation — all outputs exist in {work_dir}')
+        return sci_path, wht_path, psf_path, eff_gain_path
+
     try:
         from pyimcom.compress.compressutils import ReadFile
         from pyimcom.diagnostics.outimage_utils.helper import HDU_to_bels
@@ -301,11 +341,15 @@ def prepare_images_from_cpr(cpr_path, work_dir,
 
     from astropy.modeling.models import Gaussian2D
 
-    os.makedirs(work_dir, exist_ok=True)
 
     # ── Read CPR ──────────────────────────────────────────────────────────────
     cpr    = ReadFile(cpr_path)
-    sci    = cpr[0].data[0][0].astype(np.float32)
+    if truth:
+        sci    = cpr[0].data[0][1].astype(np.float32)
+    elif realization:
+        sci    = cpr[0].data[0][1].astype(np.float32)+cpr[0].data[0][22].astype(np.float32)
+    else:
+        sci    = cpr[0].data[0][0].astype(np.float32)
     header = cpr[0].header
 
     pix_scale = abs(header['CDELT2']) * 3600.  # arcsec/px
@@ -314,11 +358,17 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     Sigma       = 10 ** (HDU_to_bels(cpr[6]) * cpr[6].data[0])
     Neff        = 10 ** (HDU_to_bels(cpr[8]) * cpr[8].data[0])
     scalefactor = np.sum(cpr[0].data[0][21] ** 2)
-    varmap      = ((scalefactor / np.sum(Sigma)) * Sigma
-                   + np.maximum(cpr[0].data[0][1].astype(np.float32), 0)
-                   / 107.52398 / Neff)
-    varmap      = varmap.astype(np.float32)
-    wht         = np.where(varmap > 0, 1.0 / varmap, 0.).astype(np.float32)
+
+    factor      = gain / (pix_size / pix_scale) ** 2
+    sci         = sci * factor
+
+    # Background-only (correlated) variance — source shot noise excluded.
+    # Shot noise from sources must be estimated from the model during fitting.
+    corr_var    = ((scalefactor / np.sum(Sigma)) * Sigma).astype(np.float32) * factor ** 2
+    wht         = np.where(corr_var > 0, 1.0 / corr_var, 0.).astype(np.float32)
+
+    # Effective gain map: poisson_var = model_flux / eff_gain (in scaled units).
+    eff_gain    = (exptime * Neff / factor).astype(np.float32)
 
     # ── Gaussian PSF stamp ────────────────────────────────────────────────────
     if psf_fwhm_arcsec is None:
@@ -329,23 +379,30 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     yy, xx     = np.mgrid[0:stamp_size, 0:stamp_size]
     psf        = Gaussian2D(1, c, c, sigma_pix, sigma_pix)(xx, yy).astype(np.float32)
     psf       /= psf.sum()
+    if positionsize is not None:
+        position, size = positionsize
+        print(position, size)
+        wcs = WCS(header, naxis=2)
+        sci = Cutout2D(sci, position, size, wcs=wcs)
+        header.update(sci.wcs.to_header())
+        sci = sci.data
+        wht = Cutout2D(wht, position, size, wcs=wcs).data
+        eff_gain = Cutout2D(eff_gain, position, size, wcs=wcs).data
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    sci_path = os.path.join(work_dir, sci_name)
-    wht_path = os.path.join(work_dir, wht_name)
-    psf_path = os.path.join(work_dir, psf_name)
-
-    fits.writeto(sci_path, sci, header=header, overwrite=True)
-    fits.writeto(wht_path, wht, header=header, overwrite=True)
-    fits.writeto(psf_path, psf,                overwrite=True)
+    fits.writeto(sci_path,      sci,      header=header, overwrite=True)
+    fits.writeto(wht_path,      wht,      header=header, overwrite=True)
+    fits.writeto(psf_path,      psf,                     overwrite=True)
+    fits.writeto(eff_gain_path, eff_gain, header=header, overwrite=True)
 
     logger = logging.getLogger('slimfarmer')
     logger.info(f'Science  → {sci_path}  shape={sci.shape}')
-    logger.info(f'Weight   → {wht_path}  range=[{wht.min():.3g}, {wht.max():.3g}]')
+    logger.info(f'Weight   → {wht_path}  range=[{wht.min():.3g}, {wht.max():.3g}]  (background only)')
+    logger.info(f'Eff gain → {eff_gain_path}  range=[{eff_gain.min():.3g}, {eff_gain.max():.3g}]')
     logger.info(f'PSF      → {psf_path}  {stamp_size}×{stamp_size}px  '
                 f'FWHM={psf_fwhm_arcsec:.3f}"  sum={psf.sum():.6f}')
 
-    return sci_path, wht_path, psf_path
+    return sci_path, wht_path, psf_path, eff_gain_path
 
 
 def get_detection_kernel(filter_kernel):
@@ -360,3 +417,28 @@ def get_detection_kernel(filter_kernel):
         from astropy.convolution import Gaussian2DKernel
         return np.array(Gaussian2DKernel(x_stddev=filter_kernel / 2.35, factor=1))
     raise ValueError(f'Unknown filter_kernel type: {type(filter_kernel)}')
+
+
+
+import galsim, galsim.roman as groman
+def meanall_new(imageall, wall, effiall, bandall=['Y106', 'J129', 'H158']):
+    oneoverzpall= []
+    for band in bandall:
+        oneoverzpall.append(1.0/(10**(galsim.roman.getBandpasses()[band].zeropoint/2.5)))
+    oneoverzpall = np.array(oneoverzpall)/np.sum(oneoverzpall)
+    scalearray  = oneoverzpall 
+    
+    #scalearray = [0.4849, 0.4777,0.4628]
+    n = np.sum(scalearray)
+    sumall = 0
+    var_num = 0
+    effi_num=0
+    for img, w, eff, s in zip(imageall, wall, effiall, scalearray):
+        sumall += img*s
+        var_num += 1/w*(s**2)
+        effi_num += img / eff*(s**2)
+    sci = sumall/n
+    wall = n**2/var_num
+    effi_equivalent = n * sci / effi_num 
+
+    return sci, wall, effi_equivalent   

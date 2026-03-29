@@ -264,27 +264,30 @@ def get_params(model, band, zeropoint):
     try:
         flux = model.getBrightness().getFlux(band)
         flux_var = model.variance.getBrightness().getFlux(band)
-        flux_err = np.sqrt(abs(flux_var)) if flux_var > 0 else 0.0
+        flux_err_tractor = np.sqrt(abs(flux_var)) if flux_var > 0 else 0.0
     except Exception:
-        flux, flux_err = 0.0, 0.0
+        flux, flux_err_tractor = 0.0, 0.0
 
-    flux_err_des = 0.0
-    if hasattr(model, 'flux_err_des'):
-        flux_err_des = model.flux_err_des.get(band, 0.0)
-
-    flux_err_corr = 0.0
+    flux_err_corr = flux_err_tractor
     if hasattr(model, 'flux_err_corr'):
-        flux_err_corr = model.flux_err_corr.get(band, 0.0)
+        flux_err_corr = model.flux_err_corr.get(band, flux_err_tractor)
+
+    flux_err_des_raw = 0.0
+    if hasattr(model, 'flux_err_des'):
+        flux_err_des_raw = model.flux_err_des.get(band, 0.0)
+
+    sigma_prop_sq = max(0.0, flux_err_corr ** 2 - flux_err_tractor ** 2)
+    flux_err_des = float(np.sqrt(flux_err_des_raw ** 2 + sigma_prop_sq))
 
     source[f'{band}_flux'] = flux
-    source[f'{band}_flux_err'] = flux_err
+    source[f'{band}_flux_err'] = flux_err_corr
     source[f'{band}_flux_err_des'] = flux_err_des
-    source[f'{band}_flux_err_corr'] = flux_err_corr
-    source[f'{band}_flux_ujy'] = flux * 10 ** (-0.4 * (zeropoint - 23.9))
-    if flux > 0:
-        source[f'{band}_mag'] = -2.5 * np.log10(flux) + zeropoint
-    else:
-        source[f'{band}_mag'] = np.nan
+    source[f'{band}_flux_err_tractor_origin'] = flux_err_tractor
+    #source[f'{band}_flux_ujy'] = flux * 10 ** (-0.4 * (zeropoint - 23.9))
+    #if flux > 0:
+    #    source[f'{band}_mag'] = -2.5 * np.log10(flux) + zeropoint
+    #else:
+    #    source[f'{band}_mag'] = np.nan
 
     return source
 

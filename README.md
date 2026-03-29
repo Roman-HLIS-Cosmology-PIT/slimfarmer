@@ -150,10 +150,46 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 | `a`, `b`, `theta` | SEP shape moments |
 | `group_id`, `group_pop` | Group assignment and size |
 | `{band}_flux` | Fitted flux (image DN) |
-| `{band}_flux_err` | Flux uncertainty |
+| `{band}_flux_err` | Tractor Fisher flux uncertainty (see note below) |
+| `{band}_flux_err_des` | DES-style residual-based flux uncertainty |
+| `{band}_flux_err_corr` | Corrected flux uncertainty including size-propagation term (recommended) |
 | `{band}_mag` | AB magnitude |
 | `name` | Model type: `PointSource`, `SimpleGalaxy`, `ExpGalaxy`, `DevGalaxy`, `FixedCompositeGalaxy` |
+| `logre`, `logre_err` | Log half-light radius (log arcsec) and its uncertainty from model selection (ExpGalaxy / DevGalaxy) |
+| `logre_exp`, `logre_exp_err` | Exp component log half-light radius and uncertainty (FixedCompositeGalaxy) |
+| `logre_dev`, `logre_dev_err` | Dev component log half-light radius and uncertainty (FixedCompositeGalaxy) |
+| `ee1_err`, `ee2_err` | Ellipticity component uncertainties from model selection |
 | `total_rchisq` | Reduced chi² of forced photometry |
+
+### Flux error columns
+
+slimfarmer provides three flux error estimates. They differ in what sources of uncertainty they include:
+
+| Column | Formula | What it captures |
+|---|---|---|
+| `flux_err` | `sqrt(diag(H⁻¹))` at forced-phot stage | Pixel noise only, for a **fixed** template |
+| `flux_err_des` | `sqrt(χ²_local / Σw·T² / dof)` | Inflates by local √rχ² — catches model mismatch or neighbor contamination |
+| `flux_err_corr` | `sqrt(flux_err² + (dF/d·logre × logre_err)²)` | Pixel noise **plus** size-propagation uncertainty (recommended) |
+
+**Why `flux_err` underestimates the true scatter**: slimfarmer uses two-pass photometry — model selection fits the galaxy size and shape, then forced photometry freezes them and fits only flux. The Fisher error `flux_err` is the formal Cramér-Rao bound *at the forced-phot stage*, assuming the template (size, shape) is perfectly known. It does not account for the fact that the template was inferred from the same noisy data in model selection.
+
+Because flux and size are correlated within the fitting footprint (a larger template shifts flux to wider annuli, changing the matched-filter response), noise-induced scatter in `logre` from model selection propagates into scatter in the forced flux. This is the **size-propagation** term:
+
+```
+σ_prop = |dF/d·logre| × logre_err
+flux_err_corr = sqrt(flux_err² + σ_prop²)
+```
+
+`dF/d·logre` is estimated numerically by perturbing `logre` by ±0.05 (5% in radius) and evaluating the linear matched-filter flux on the fitting footprint. `logre_err` comes from the model-selection Fisher matrix, stored correctly from that stage.
+
+**Empirical validation** (single bright ExpGalaxy, mag=21, HLR=0.5", read-noise dominated):
+
+| Error estimate | Value | MC ground truth (`std` over 100 realisations) |
+|---|---|---|
+| `flux_err` | 0.64 DN | — |
+| `flux_err_corr` | 0.83 DN | 1.14 DN |
+
+`flux_err_corr` closes ~60% of the gap. The residual underestimate occurs because `logre_err` from the Fisher matrix is a formal lower bound — the actual population scatter in `logre` across noise realisations can be larger due to nonlinear model-selection effects (local minima, profile-type switching). For science use, `flux_err_corr` is the recommended single-object error; for calibrating the full error budget, MC simulations remain the ground truth.
 
 ---
 

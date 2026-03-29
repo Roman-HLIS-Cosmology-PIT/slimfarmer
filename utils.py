@@ -247,6 +247,19 @@ def get_params(model, band, zeropoint):
         source['logre_dev'] = model.shapeDev.logre
         source['ee1_dev']   = model.shapeDev.ee1
         source['ee2_dev']   = model.shapeDev.ee2
+        try:
+            var_exp = model.variance.shapeExp
+            var_dev = model.variance.shapeDev
+            source['logre_exp_err'] = np.sqrt(abs(var_exp.logre))
+            source['ee1_exp_err']   = np.sqrt(abs(var_exp.ee1))
+            source['ee2_exp_err']   = np.sqrt(abs(var_exp.ee2))
+            source['logre_dev_err'] = np.sqrt(abs(var_dev.logre))
+            source['ee1_dev_err']   = np.sqrt(abs(var_dev.ee1))
+            source['ee2_dev_err']   = np.sqrt(abs(var_dev.ee2))
+        except Exception:
+            for key in ('logre_exp_err', 'ee1_exp_err', 'ee2_exp_err',
+                        'logre_dev_err', 'ee1_dev_err', 'ee2_dev_err'):
+                source[key] = 0.0
 
     try:
         flux = model.getBrightness().getFlux(band)
@@ -255,8 +268,18 @@ def get_params(model, band, zeropoint):
     except Exception:
         flux, flux_err = 0.0, 0.0
 
+    flux_err_des = 0.0
+    if hasattr(model, 'flux_err_des'):
+        flux_err_des = model.flux_err_des.get(band, 0.0)
+
+    flux_err_corr = 0.0
+    if hasattr(model, 'flux_err_corr'):
+        flux_err_corr = model.flux_err_corr.get(band, 0.0)
+
     source[f'{band}_flux'] = flux
     source[f'{band}_flux_err'] = flux_err
+    source[f'{band}_flux_err_des'] = flux_err_des
+    source[f'{band}_flux_err_corr'] = flux_err_corr
     source[f'{band}_flux_ujy'] = flux * 10 ** (-0.4 * (zeropoint - 23.9))
     if flux > 0:
         source[f'{band}_mag'] = -2.5 * np.log10(flux) + zeropoint

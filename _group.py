@@ -410,10 +410,23 @@ class _Group:
         cat_var = copy.deepcopy(cat)
         cat_var.setParams(self.variance)
 
+        # At forced-phot (stage 11), shape params are frozen so cat_var[i].shape
+        # holds the *fitted value*, not a Fisher variance.  The model-selection
+        # shape variances are still in cat[i].variance.shape (set by the final
+        # determine_models _store_models call and preserved through _update_models
+        # deepcopy).  Cache them here so we can restore them after the assignment.
+        shape_var_cache = {}
+        if self.stage == 11:
+            for i, sid in enumerate(self.source_ids):
+                if hasattr(cat[i], 'variance'):
+                    shape_var_cache[sid] = self._get_shape_var(cat[i].variance)
+
         for i, sid in enumerate(self.source_ids):
             model = cat[i]
             variance = cat_var[i]
             model.variance = variance
+            if sid in shape_var_cache:
+                self._restore_shape_var(model.variance, shape_var_cache[sid])
             self.model_tracker[sid][self.stage]['model'] = model
 
             if self.solved is not None and (self.solved.all() or self.stage == 11):
@@ -578,6 +591,213 @@ class _Group:
         self.logger.debug(f'Modelling done ({time.time()-tstart:.2f}s)')
         return True
 
+    def _compute_des_flux_err(self):
+        """Compute DES-style flux error from pixel residuals (MOF afterburner approach).
+
+        Mirrors mof/moflib.py:L1373 (esheldon/mof), restricted to each source's
+        model footprint (model_i > 1e-3 × peak) and using the full invvar
+        (background + model Poisson, from _update_invvar_with_model).
+
+        Why footprint: the group fitting region is much larger than a MOF stamp,
+        so background pixels (model≈0) dilute chi2/dof → 1 regardless of noise.
+        Why full invvar (not invvar_bg): with invvar_bg, chi2/dof gives an
+        unweighted average of σ_tot²/σ_bg² while the matched filter ψ²-weights
+        those noisy center pixels, causing a systematic flux_err_des ~ 0.8×flux_err_tractor.
+        With full invvar, chi2/dof ≈ 1 for a perfect fit → flux_err_des ≈ flux_err_tractor,
+        and any model error / neighbour contamination raises chi2/dof > 1 →
+        flux_err_des > flux_err_tractor.
+
+        For each source i and band b:
+            footprint = pixels where model_i > 1e-3 × max(model_i)
+            chi2    = sum over footprint of (data - model_total)^2 * invvar
+            msq_sum = sum over footprint of invvar * (model_i / flux_i)^2
+            dof     = n_footprint_pixels - 1
+            flux_err_des = sqrt(chi2 / msq_sum / dof)
+        """
+        if self.engine is None or not self.images:
+            return
+
+        nobj = len(self.source_ids)
+
+        for ib, (band, img) in enumerate(self.images.items()):
+            model_total = self.engine.getModelImage(ib)
+            # Use img.invvar (background + model Poisson, updated by
+            # _update_invvar_with_model).  For a perfect fit chi2/dof ≈ 1 and
+            # flux_err_des ≈ flux_err_tractor; any model error, neighbour
+            # contamination, or PSF mismatch drives chi2/dof > 1 so that
+            # flux_err_des > flux_err_tractor.  Using invvar_bg instead causes
+            # the unweighted chi2/dof to underestimate shot noise (shot noise is
+            # ψ²-weighted in the MF but averaged uniformly in chi2), yielding a
+            # systematic flux_err_des/flux_err_tractor ~ 0.8.
+            invvar = img.invvar
+            chi_image = (img.data - model_total) * np.sqrt(invvar)
+
+            for sid in self.source_ids:
+                if sid not in self.model_catalog:
+                    continue
+                model = self.model_catalog[sid]
+                if not hasattr(model, 'flux_err_des'):
+                    model.flux_err_des = {}
+
+                try:
+                    flux = model.getBrightness().getFlux(band)
+                except Exception:
+                    flux = 0.0
+
+                if flux == 0.0:
+                    model.flux_err_des[band] = 0.0
+                    continue
+
+                src_copy = copy.deepcopy(model)
+                temp_engine = Tractor([img], [src_copy])
+                temp_engine.bands = [band]
+                model_img = temp_engine.getModelImage(0)
+
+                # Restrict to the model footprint so that background-dominated
+                # pixels (model ≈ 0) do not dilute chi2/dof toward 1 and wash
+                # out the shot-noise signal.  In MOF each source has its own
+                # small stamp so N_pix ≈ N_eff; here the group fitting region
+                # is much larger, making the full-region chi2/dof ≈ 1 regardless
+                # of shot noise → flux_err_des < flux_err_tractor (wrong).
+                # Masking to the PSF footprint restores chi2/dof ≈ σ_tot²/σ_bg².
+                model_peak = float(np.max(model_img))
+                if model_peak <= 0:
+                    model.flux_err_des[band] = 0.0
+                    continue
+                footprint = model_img > 1e-3 * model_peak
+
+                invvar_foot = invvar[footprint]
+                valid = invvar_foot > 0
+                if not np.any(valid):
+                    model.flux_err_des[band] = 0.0
+                    continue
+
+                chi2 = float(np.sum(chi_image[footprint][valid] ** 2))
+                msq_sum = float(np.sum(invvar_foot[valid]
+                                       * (model_img[footprint][valid] / flux) ** 2))
+                ndof = max(1, int(np.sum(valid)) - 1)
+
+                if msq_sum <= 0:
+                    model.flux_err_des[band] = 0.0
+                    continue
+
+                arg = chi2 / msq_sum / ndof
+                model.flux_err_des[band] = float(np.sqrt(arg)) if arg > 0 else 0.0
+
+    def _get_shape_var(self, variance_obj):
+        """Return {attr: deepcopy(attr)} for shape sub-objects in a variance model."""
+        saved = {}
+        for attr in ('shape', 'shapeExp', 'shapeDev'):
+            obj = getattr(variance_obj, attr, None)
+            if obj is not None:
+                try:
+                    saved[attr] = copy.deepcopy(obj)
+                except Exception:
+                    pass
+        return saved
+
+    def _restore_shape_var(self, variance_obj, saved):
+        """Restore previously saved shape sub-objects into a variance model."""
+        for attr, obj in saved.items():
+            try:
+                setattr(variance_obj, attr, obj)
+            except Exception:
+                pass
+
+    def _logre_flux_deriv(self, model, img, band, delta):
+        """Numerical central-difference dF_forced / d(logre).
+
+        Perturbs logre by ±delta and computes the linear matched-filter flux
+        estimate on the fitting footprint to get dF/d(logre).
+        """
+        from tractor.ellipses import EllipseESoft
+
+        logre0 = float(model.shape.logre)
+        ee1_0  = float(model.shape.ee1)
+        ee2_0  = float(model.shape.ee2)
+
+        def _linear_flux(logre_val):
+            src = copy.deepcopy(model)
+            # Construct a fresh (unfrozen) shape so rendering works regardless
+            # of whether the original shape params are frozen.
+            src.shape = EllipseESoft(logre_val, ee1_0, ee2_0)
+            temp = Tractor([img], [src])
+            temp.bands = [band]
+            model_img = temp.getModelImage(0)
+            try:
+                flux = float(src.getBrightness().getFlux(band))
+            except Exception:
+                return None
+            if abs(flux) < 1e-30:
+                return None
+            unit_t = model_img / flux
+            denom = float(np.sum(img.invvar * unit_t ** 2))
+            if denom <= 0:
+                return None
+            return float(np.sum(img.invvar * img.data * unit_t)) / denom
+
+        F_plus  = _linear_flux(logre0 + delta)
+        F_minus = _linear_flux(logre0 - delta)
+        if F_plus is None or F_minus is None:
+            return 0.0
+        return (F_plus - F_minus) / (2.0 * delta)
+
+    def _compute_flux_err_corr(self):
+        """Propagate model-selection logre uncertainty into flux_err.
+
+        For ExpGalaxy / DevGalaxy sources, estimates dF/d(logre) numerically
+        and adds the size-propagation term in quadrature with the Fisher error:
+
+            flux_err_corr = sqrt( flux_err² + (dF/d·logre × logre_err)² )
+
+        Result stored as model.flux_err_corr[band].  For PointSource /
+        SimpleGalaxy / FixedCompositeGalaxy, flux_err_corr = flux_err.
+        """
+        if self.engine is None or not self.images:
+            return
+
+        D_LOGRE = 0.05  # ±0.05 in log(arcsec) ≈ ±5 % change in r_e
+
+        for ib, (band, img) in enumerate(self.images.items()):
+            for sid in self.source_ids:
+                if sid not in self.model_catalog:
+                    continue
+                model = self.model_catalog[sid]
+                if not hasattr(model, 'flux_err_corr'):
+                    model.flux_err_corr = {}
+
+                try:
+                    flux_var = model.variance.getBrightness().getFlux(band)
+                    flux_err = float(np.sqrt(abs(flux_var))) if flux_var > 0 else 0.0
+                except Exception:
+                    model.flux_err_corr[band] = 0.0
+                    continue
+
+                if not isinstance(model, (ExpGalaxy, DevGalaxy)):
+                    model.flux_err_corr[band] = flux_err
+                    continue
+
+                try:
+                    logre_var = model.variance.shape.logre
+                    logre_err = float(np.sqrt(abs(logre_var))) if logre_var > 0 else 0.0
+                except Exception:
+                    model.flux_err_corr[band] = flux_err
+                    continue
+
+                if logre_err == 0.0:
+                    model.flux_err_corr[band] = flux_err
+                    continue
+
+                try:
+                    dF = self._logre_flux_deriv(model, img, band, D_LOGRE)
+                except Exception:
+                    model.flux_err_corr[band] = flux_err
+                    continue
+
+                sigma_prop = abs(dF) * logre_err
+                model.flux_err_corr[band] = float(
+                    np.sqrt(flux_err ** 2 + sigma_prop ** 2))
+
     def _subtract_neighbor_contributions(self, neighboring_models):
         """Subtract PSF-convolved neighbor model images from the staged image data."""
         neighbor_list = [copy.deepcopy(m) for sid, m in neighboring_models.items()
@@ -631,6 +851,8 @@ class _Group:
             return False
         self._measure_stats(self.stage)
         self._store_models()
+        self._compute_des_flux_err()
+        self._compute_flux_err_corr()
         return True
 
 

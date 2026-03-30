@@ -197,6 +197,14 @@ def set_priors(model, priors):
             reff_rule = priors.get('reff', 'none')
             if reff_rule in ('fix', 'freeze'):
                 model[idx].freezeParam(0)
+            elif isinstance(reff_rule, tuple):
+                # (Quantity, 'fix') → set logre to log(value_arcsec) then freeze
+                target_qty, action = reff_rule
+                reff_arcsec = target_qty.to(u.arcsec).value if hasattr(target_qty, 'to') else float(target_qty)
+                logre_target = float(np.log(reff_arcsec))
+                model[idx].logre = logre_target
+                if action in ('fix', 'freeze'):
+                    model[idx].freezeParam(0)
             elif reff_rule != 'none':
                 sigma_arcsec = reff_rule.to(u.arcsec).value
                 logre_val = float(model[idx].logre)
@@ -277,11 +285,29 @@ def get_params(model, band, zeropoint):
         flux_err_des_raw = model.flux_err_des.get(band, 0.0)
 
     sigma_prop_sq = max(0.0, flux_err_corr ** 2 - flux_err_tractor ** 2)
-    flux_err_des = float(np.sqrt(flux_err_des_raw ** 2 + sigma_prop_sq))
+
+    flux_err_noshot_raw = flux_err_tractor
+    if hasattr(model, 'flux_err_noshot_raw'):
+        flux_err_noshot_raw = model.flux_err_noshot_raw.get(band, flux_err_tractor)
+    flux_err_noshot = float(np.sqrt(flux_err_noshot_raw ** 2 + sigma_prop_sq))
+
+    flux_err_shot_raw = flux_err_tractor
+    if hasattr(model, 'flux_err_shot_raw'):
+        flux_err_shot_raw = model.flux_err_shot_raw.get(band, flux_err_tractor)
+    flux_err_shot = float(np.sqrt(flux_err_shot_raw ** 2 + sigma_prop_sq))
+
+    # Scale flux_err_des by the marginalization ratio so it captures both
+    # model mismatch (chi2/dof) AND parameter-marginalization inflation.
+    flux_err_shot_fixed = flux_err_tractor
+    if hasattr(model, 'flux_err_shot_raw_fixed'):
+        flux_err_shot_fixed = model.flux_err_shot_raw_fixed.get(band, flux_err_tractor)
+    marg_ratio = flux_err_shot_raw / flux_err_shot_fixed if flux_err_shot_fixed > 0 else 1.0
+    flux_err_des = float(np.sqrt((flux_err_des_raw * marg_ratio) ** 2 + sigma_prop_sq))
 
     source[f'{band}_flux'] = flux
-    source[f'{band}_flux_err'] = flux_err_corr
+    source[f'{band}_flux_err'] = flux_err_shot
     source[f'{band}_flux_err_des'] = flux_err_des
+    source[f'{band}_flux_err_noshot'] = flux_err_noshot
     source[f'{band}_flux_err_tractor_origin'] = flux_err_tractor
     #source[f'{band}_flux_ujy'] = flux * 10 ** (-0.4 * (zeropoint - 23.9))
     #if flux > 0:

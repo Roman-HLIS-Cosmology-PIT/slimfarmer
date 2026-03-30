@@ -3,3 +3,9 @@ astropy>=5.0
 scipy
 sep
 tqdm
+
+[galsim]
+galsim
+
+[parallel]
+pathos

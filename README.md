@@ -150,9 +150,10 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 | `a`, `b`, `theta` | SEP shape moments |
 | `group_id`, `group_pop` | Group assignment and size |
 | `{band}_flux` | Fitted flux (image DN) |
-| `{band}_flux_err` | Tractor Fisher flux uncertainty (see note below) |
+| `{band}_flux_err` | Marginalized Fisher flux uncertainty including shot noise (recommended; see below) |
+| `{band}_flux_err_noshot` | Marginalized Fisher flux uncertainty, background noise only (shot noise excluded) |
 | `{band}_flux_err_des` | DES-style residual-based flux uncertainty |
-| `{band}_flux_err_corr` | Corrected flux uncertainty including size-propagation term (recommended) |
+| `{band}_flux_err_tractor_origin` | Raw Tractor diagonal Fisher error (fixed-template, not marginalized) |
 | `{band}_mag` | AB magnitude |
 | `name` | Model type: `PointSource`, `SimpleGalaxy`, `ExpGalaxy`, `DevGalaxy`, `FixedCompositeGalaxy` |
 | `logre`, `logre_err` | Log half-light radius (log arcsec) and its uncertainty from model selection (ExpGalaxy / DevGalaxy) |
@@ -163,33 +164,67 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 
 ### Flux error columns
 
-slimfarmer provides three flux error estimates. They differ in what sources of uncertainty they include:
+slimfarmer provides three flux error estimates:
 
 | Column | Formula | What it captures |
 |---|---|---|
-| `flux_err` | `sqrt(diag(H⁻¹))` at forced-phot stage | Pixel noise only, for a **fixed** template |
-| `flux_err_des` | `sqrt(χ²_local / Σw·T² / dof)` | Inflates by local √rχ² — catches model mismatch or neighbor contamination |
-| `flux_err_corr` | `sqrt(flux_err² + (dF/d·logre × logre_err)²)` | Pixel noise **plus** size-propagation uncertainty (recommended) |
+| `flux_err` | Marginalized Fisher (bg + shot noise) | Full noise budget, marginalized over all fitted parameters (recommended) |
+| `flux_err_noshot` | Marginalized Fisher (bg noise only) | Background-only noise, marginalized over all fitted parameters |
+| `flux_err_des` | DES residual-based × marginalization ratio | Catches model mismatch AND parameter marginalization |
 
-**Why `flux_err` underestimates the true scatter**: slimfarmer uses two-pass photometry — model selection fits the galaxy size and shape, then forced photometry freezes them and fits only flux. The Fisher error `flux_err` is the formal Cramér-Rao bound *at the forced-phot stage*, assuming the template (size, shape) is perfectly known. It does not account for the fact that the template was inferred from the same noisy data in model selection.
+#### How the marginalized Fisher error works
 
-Because flux and size are correlated within the fitting footprint (a larger template shifts flux to wider annuli, changing the matched-filter response), noise-induced scatter in `logre` from model selection propagates into scatter in the forced flux. This is the **size-propagation** term:
+slimfarmer uses two-pass photometry: model selection fits the galaxy size, shape, and position, then forced photometry freezes morphology and refits only flux. A naive Fisher error (the Cramer-Rao bound for a **fixed** template) underestimates the true scatter because it ignores the fact that the template was inferred from the same noisy data.
+
+When non-flux parameters (position, ellipticity, size) are jointly fitted, the best-fit template correlates with the noise realization. Each noise draw nudges the fitted position and shape slightly, and the template rendered at those shifted parameters partially "follows" the noise, inflating the flux scatter beyond the fixed-template prediction. MC tests show this effect inflates sigma_MC by ~30% for a typical ExpGalaxy (mag=21, HLR=0.8", Roman H158).
+
+To account for this, `flux_err` and `flux_err_noshot` build the **full Fisher information matrix** over all thawed source parameters (flux, position, shape) using the appropriate inverse-variance map, add Gaussian prior contributions, invert, and extract the marginalized flux variance:
 
 ```
-σ_prop = |dF/d·logre| × logre_err
-flux_err_corr = sqrt(flux_err² + σ_prop²)
+F_ij = Σ_pix [ invvar_pix × (∂model/∂θ_i) × (∂model/∂θ_j) ]  +  prior Hessian
+Cov  = F⁻¹
+flux_err = sqrt(Cov[flux, flux])
 ```
 
-`dF/d·logre` is estimated numerically by perturbing `logre` by ±0.05 (5% in radius) and evaluating the linear matched-filter flux on the fitting footprint. `logre_err` comes from the model-selection Fisher matrix, stored correctly from that stage.
+Model derivatives are computed by central finite differences using Tractor's step sizes.
 
-**Empirical validation** (single bright ExpGalaxy, mag=21, HLR=0.5", read-noise dominated):
+The two variants differ only in the weight map used:
 
-| Error estimate | Value | MC ground truth (`std` over 100 realisations) |
+| Column | Weight map |
+|---|---|
+| `flux_err` | `1 / (σ²_bg + model_flux / eff_gain)` — includes source Poisson shot noise |
+| `flux_err_noshot` | `1 / σ²_bg` — background variance only |
+
+`flux_err_noshot` isolates the background noise contribution and is useful for comparing predicted vs observed scatter in simulations where shot noise can be toggled off.
+
+#### How `flux_err_des` incorporates the marginalization correction
+
+The raw DES error is `flux_err_fixed * sqrt(χ²/dof)` — it scales the fixed-template Fisher bound by the local reduced chi-squared. The `sqrt(χ²/dof)` factor catches **model misfit** (wrong PSF, neighbor contamination) because these raise χ²/dof above 1.
+
+However, the noise-correlated template effect actually makes the model fit the data **too well**: the template partially overfits the noise, so χ²/dof stays near 1. The raw DES error is blind to this.
+
+To fix this, slimfarmer replaces the fixed-template baseline with the marginalized Fisher:
+
+```
+marg_ratio   = flux_err_marginalized / flux_err_fixed_template
+flux_err_des = flux_err_des_raw × marg_ratio
+```
+
+This preserves the DES chi2/dof scaling while raising the floor from the fixed-template bound to the correct marginalized bound. When the model fits well (χ²/dof ≈ 1), `flux_err_des ≈ flux_err` (the marginalized Fisher). When the model fits poorly (χ²/dof > 1), the error inflates further on top of the marginalization correction.
+
+#### Empirical validation
+
+Single ExpGalaxy, mag=21, HLR=0.8", Roman H158, EXPTIME=642s, read-noise=10e, N=200 MC realizations, `noshot=True`:
+
+| Error estimate | Mean value | sigma_MC / mean |
 |---|---|---|
-| `flux_err` | 0.64 DN | — |
-| `flux_err_corr` | 0.83 DN | 1.14 DN |
+| Fixed-template Fisher (old `flux_err`) | 0.78 e/s | 1.32 |
+| **Marginalized Fisher (`flux_err_noshot`)** | **0.94 e/s** | **1.10** |
+| MC ground truth (`std` over realizations) | 1.03 e/s | 1.00 |
 
-`flux_err_corr` closes ~60% of the gap. The residual underestimate occurs because `logre_err` from the Fisher matrix is a formal lower bound — the actual population scatter in `logre` across noise realisations can be larger due to nonlinear model-selection effects (local minima, profile-type switching). For science use, `flux_err_corr` is the recommended single-object error; for calibrating the full error budget, MC simulations remain the ground truth.
+The marginalized Fisher closes ~80% of the gap between the fixed-template bound and the MC truth. The residual ~10% is expected higher-order estimator inefficiency beyond the Cramer-Rao bound (the CR bound is a lower bound on variance for any unbiased estimator; the actual joint position+flux+shape estimator has some nonlinear inefficiency that the Fisher matrix cannot capture).
+
+For science use, `flux_err` (with shot noise) is the recommended single-object error. For calibrating the full error budget, MC simulations remain the ground truth.
 
 ---
 

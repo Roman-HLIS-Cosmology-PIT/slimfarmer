@@ -35,7 +35,7 @@ from .utils import SimpleGalaxy, prepare_images_from_cpr
 from .track import track_source, _get_flux_converters
 from .diag import diagnose_source
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 __all__ = ['Config', 'FarmerImage', 'run_photometry', 'SimpleGalaxy',
            'prepare_images_from_cpr', 'track_source', '_get_flux_converters',
            'diagnose_source']

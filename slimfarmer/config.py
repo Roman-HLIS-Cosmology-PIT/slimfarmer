@@ -40,6 +40,9 @@ class Config:
     modeling_bands = None  # list of bands used for model-type selection; None = detection band only
     model_priors = {'pos': 0.1*u.arcsec, 'reff': 0.5*u.arcsec, 'shape': 'none', 'fracDev': 'none'}
     phot_priors  = {'pos': 0.001*u.arcsec, 'reff': 'freeze', 'shape': 'freeze', 'fracDev': 'freeze'}
+    fixed_reff   = None    # astropy Quantity (arcsec) or None; when set, forces logre = log(value)
+                           # and freezes it in all stages, overriding model_priors['reff']
+    noshot=False
     sufficient_thresh      = 0.3    # rchisq < 1 means model is good enough
     simplegalaxy_penalty   = 0.1    # PS must beat SG by this margin to be preferred (blob.py PS_SG_THRESH1)
     exp_dev_similar_thresh = 0.1    # |exp_rchisq - dev_rchisq| < this → try Composite (blob.py EXP_DEV_THRESH)

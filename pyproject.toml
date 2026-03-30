@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slimfarmer"
+version = "1.1.0"
+description = "Streamlined single/multi-band Tractor model photometry"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "astropy>=5.0",
+    "scipy",
+    "sep",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+parallel = ["pathos"]
+galsim = ["galsim"]
+
+[tool.setuptools.packages.find]
+include = ["slimfarmer*"]
+
+[tool.setuptools.package-data]
+slimfarmer = ["conv_filters/*.conv"]

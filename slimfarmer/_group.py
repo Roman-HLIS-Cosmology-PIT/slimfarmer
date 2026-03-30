@@ -253,7 +253,10 @@ class _Group:
                     b_pix = a_pix
                 guess_r = np.sqrt(a_pix * b_pix) * pixscl
                 ba = min(b_pix / a_pix, 1.0)
-                shape = EllipseESoft.fromRAbPhi(max(guess_r, 0.01), ba, pa)
+                if self.config.fixed_reff is not None:
+                    shape = EllipseESoft.fromRAbPhi(self.config.fixed_reff, ba, pa)
+                else:
+                    shape = EllipseESoft.fromRAbPhi(max(guess_r, 0.01), ba, pa)
             shape.lowers = [-3, -10.0, -10.0]
             shape.uppers = [1,   10.0,  10.0]
             if isinstance(tmpl, PointSource):
@@ -295,7 +298,10 @@ class _Group:
             model_img = self.engine.getModelImage(i)
             bg_var = np.where(bd['invvar_bg'] > 0, 1.0 / bd['invvar_bg'], np.inf)
             poisson_var = np.maximum(model_img, 0.) / bd['eff_gain']
-            total_var = bg_var + poisson_var
+            if not self.config.noshot:
+                total_var = bg_var + poisson_var
+            else:
+                total_var = bg_var
             img.setInvvar(np.where(total_var > 0, 1.0 / total_var, 0.))
 
     def _optimize(self):
@@ -664,7 +670,7 @@ class _Group:
                 if model_peak <= 0:
                     model.flux_err_des[band] = 0.0
                     continue
-                footprint = model_img > 1e-3 * model_peak
+                footprint = model_img > 1e-2 * model_peak
 
                 invvar_foot = invvar[footprint]
                 valid = invvar_foot > 0
@@ -798,6 +804,149 @@ class _Group:
                 model.flux_err_corr[band] = float(
                     np.sqrt(flux_err ** 2 + sigma_prop ** 2))
 
+    def _compute_flux_err_noshot(self):
+        """Marginalized Fisher flux error using background-only invvar.
+
+        Builds the full Fisher matrix over all thawed source parameters
+        (flux, position, shape, …) using invvar_bg (background-only weights,
+        shot noise excluded), adds Gaussian prior contributions, inverts,
+        and extracts the marginalized flux variance.
+
+        This correctly accounts for the noise-correlated template effect:
+        when non-flux parameters are jointly fitted, the template correlates
+        with the noise realization, inflating the effective flux scatter
+        beyond the fixed-template Fisher bound.
+
+        Result stored as model.flux_err_noshot_raw[band].
+        """
+        if self.engine is None or not self.images:
+            return
+
+        for ib, (band, img) in enumerate(self.images.items()):
+            invvar_bg = self.band_data[band].get('invvar_bg')
+            if invvar_bg is None:
+                continue
+            self._compute_marginal_fisher_flux_err(
+                band, img, invvar_bg, 'flux_err_noshot_raw')
+
+    def _compute_flux_err_shot(self):
+        """Marginalized Fisher flux error using total invvar (bg + shot noise).
+
+        Same as _compute_flux_err_noshot but uses the full inverse variance
+        that includes model-based Poisson shot noise, giving the flux error
+        expected when shot noise from the source is present.
+
+        Result stored as model.flux_err_shot_raw[band].
+        """
+        if self.engine is None or not self.images:
+            return
+
+        for ib, (band, img) in enumerate(self.images.items()):
+            bd = self.band_data[band]
+            invvar_bg = bd.get('invvar_bg')
+            if invvar_bg is None:
+                continue
+            eff_gain = bd.get('eff_gain')
+            model_img = self.engine.getModelImage(ib)
+            bg_var = np.where(invvar_bg > 0, 1.0 / invvar_bg, np.inf)
+            poisson_var = (np.maximum(model_img, 0.0) / eff_gain
+                          if eff_gain is not None
+                          else np.zeros_like(bg_var))
+            total_var = bg_var + poisson_var
+            invvar_total = np.where(total_var > 0, 1.0 / total_var, 0.0)
+            self._compute_marginal_fisher_flux_err(
+                band, img, invvar_total, 'flux_err_shot_raw')
+
+    def _compute_marginal_fisher_flux_err(self, band, img, invvar, attr_name):
+        """Shared logic: build Fisher matrix with given invvar, extract flux err.
+
+        Stores two values per source per band:
+          model.<attr_name>[band]          — marginalized flux error
+          model.<attr_name + '_fixed'>[band] — fixed-template (diagonal) flux error
+        The ratio of these is used to scale flux_err_des.
+        """
+        fixed_attr = attr_name + '_fixed'
+        for sid in self.source_ids:
+            if sid not in self.model_catalog:
+                continue
+            model = self.model_catalog[sid]
+            if not hasattr(model, attr_name):
+                setattr(model, attr_name, {})
+            if not hasattr(model, fixed_attr):
+                setattr(model, fixed_attr, {})
+
+            try:
+                flux = float(model.getBrightness().getFlux(band))
+            except Exception:
+                flux = 0.0
+
+            if flux == 0.0:
+                getattr(model, attr_name)[band] = 0.0
+                getattr(model, fixed_attr)[band] = 0.0
+                continue
+
+            src_copy = copy.deepcopy(model)
+            temp_engine = Tractor([img], [src_copy])
+            temp_engine.bands = [band]
+            temp_engine.freezeParam('images')
+
+            unit_t = temp_engine.getModelImage(0) / flux
+            F_ff = float(np.sum(invvar * unit_t ** 2))
+            fixed_err = 1.0 / np.sqrt(F_ff) if F_ff > 0 else 0.0
+            getattr(model, fixed_attr)[band] = fixed_err
+
+            p0 = np.array(src_copy.getParams())
+            n_params = len(p0)
+            if n_params == 0:
+                getattr(model, attr_name)[band] = fixed_err
+                continue
+
+            step_sizes = np.array(src_copy.getStepSizes())
+            derivs = np.zeros((n_params, invvar.size))
+
+            for ip in range(n_params):
+                dp = max(step_sizes[ip], 1e-10)
+                pp = p0.copy(); pp[ip] += dp
+                src_copy.setParams(pp)
+                mp = temp_engine.getModelImage(0).ravel()
+                pm = p0.copy(); pm[ip] -= dp
+                src_copy.setParams(pm)
+                mm = temp_engine.getModelImage(0).ravel()
+                derivs[ip] = (mp - mm) / (2.0 * dp)
+                src_copy.setParams(p0)
+
+            w = invvar.ravel()
+            fisher = np.zeros((n_params, n_params))
+            for i in range(n_params):
+                for j in range(i, n_params):
+                    val = float(np.sum(w * derivs[i] * derivs[j]))
+                    fisher[i, j] = val
+                    fisher[j, i] = val
+
+            if hasattr(src_copy, 'getLogPriorDerivatives'):
+                try:
+                    prior_derivs = src_copy.getLogPriorDerivatives()
+                    for ip, (_, _, dd) in enumerate(prior_derivs):
+                        fisher[ip, ip] += max(-dd, 0.0)
+                except Exception:
+                    pass
+
+            flux_idx = None
+            param_names = src_copy.getParamNames()
+            for ip, pn in enumerate(param_names):
+                if band in pn or pn.startswith('brightness'):
+                    flux_idx = ip
+                    break
+            if flux_idx is None:
+                flux_idx = 0
+
+            try:
+                cov = np.linalg.inv(fisher)
+                margvar = max(cov[flux_idx, flux_idx], 0.0)
+                getattr(model, attr_name)[band] = float(np.sqrt(margvar))
+            except np.linalg.LinAlgError:
+                getattr(model, attr_name)[band] = fixed_err
+
     def _subtract_neighbor_contributions(self, neighboring_models):
         """Subtract PSF-convolved neighbor model images from the staged image data."""
         neighbor_list = [copy.deepcopy(m) for sid, m in neighboring_models.items()
@@ -853,6 +1002,8 @@ class _Group:
         self._store_models()
         self._compute_des_flux_err()
         self._compute_flux_err_corr()
+        self._compute_flux_err_noshot()
+        self._compute_flux_err_shot()
         return True
 
 

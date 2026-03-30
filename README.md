@@ -168,9 +168,9 @@ slimfarmer provides three flux error estimates:
 
 | Column | Formula | What it captures |
 |---|---|---|
-| `flux_err` | Marginalized Fisher (bg + shot noise) | Full noise budget, marginalized over all fitted parameters (recommended) |
-| `flux_err_noshot` | Marginalized Fisher (bg noise only) | Background-only noise, marginalized over all fitted parameters |
-| `flux_err_des` | DES residual-based × marginalization ratio | Catches model mismatch AND parameter marginalization |
+| `flux_err` | Marginalized Fisher (bg + shot noise) + size propagation | Full noise budget, marginalized over fitted parameters, plus size uncertainty from model selection (recommended) |
+| `flux_err_noshot` | Marginalized Fisher (bg noise only) + size propagation | Background-only noise, marginalized over fitted parameters, plus size uncertainty |
+| `flux_err_des` | DES residual-based × marginalization ratio + size propagation | Catches model mismatch, parameter marginalization, and size uncertainty |
 
 #### How the marginalized Fisher error works
 
@@ -178,22 +178,35 @@ slimfarmer uses two-pass photometry: model selection fits the galaxy size, shape
 
 When non-flux parameters (position, ellipticity, size) are jointly fitted, the best-fit template correlates with the noise realization. Each noise draw nudges the fitted position and shape slightly, and the template rendered at those shifted parameters partially "follows" the noise, inflating the flux scatter beyond the fixed-template prediction. MC tests show this effect inflates sigma_MC by ~30% for a typical ExpGalaxy (mag=21, HLR=0.8", Roman H158).
 
-To account for this, `flux_err` and `flux_err_noshot` build the **full Fisher information matrix** over all thawed source parameters (flux, position, shape) using the appropriate inverse-variance map, add Gaussian prior contributions, invert, and extract the marginalized flux variance:
+To account for this, the error computation has two components:
+
+**Component 1: Marginalized Fisher error** — builds the **full Fisher information matrix** over all thawed source parameters (flux, position, shape) during forced photometry, adds Gaussian prior contributions, inverts, and extracts the marginalized flux variance:
 
 ```
 F_ij = Σ_pix [ invvar_pix × (∂model/∂θ_i) × (∂model/∂θ_j) ]  +  prior Hessian
 Cov  = F⁻¹
-flux_err = sqrt(Cov[flux, flux])
+flux_err_marg = sqrt(Cov[flux, flux])
 ```
 
-Model derivatives are computed by central finite differences using Tractor's step sizes.
+Model derivatives are computed by central finite differences using Tractor's step sizes. The two variants differ only in the weight map:
 
-The two variants differ only in the weight map used:
-
-| Column | Weight map |
+| Variant | Weight map |
 |---|---|
-| `flux_err` | `1 / (σ²_bg + model_flux / eff_gain)` — includes source Poisson shot noise |
-| `flux_err_noshot` | `1 / σ²_bg` — background variance only |
+| `flux_err_shot_raw` | `1 / (σ²_bg + model_flux / eff_gain)` — includes source Poisson shot noise |
+| `flux_err_noshot_raw` | `1 / σ²_bg` — background variance only |
+
+**Component 2: Size propagation** — forced photometry freezes morphology (size, shape), so the Fisher matrix above cannot capture size uncertainty from model selection. For ExpGalaxy/DevGalaxy sources, the size propagation term estimates `dF/d(logre)` numerically and combines it with `logre_err` from model selection:
+
+```
+sigma_prop = |dF/d(logre)| × logre_err
+```
+
+**Final error**: the two components are added in quadrature:
+
+```
+flux_err       = sqrt(flux_err_shot_raw²   + sigma_prop²)
+flux_err_noshot = sqrt(flux_err_noshot_raw² + sigma_prop²)
+```
 
 `flux_err_noshot` isolates the background noise contribution and is useful for comparing predicted vs observed scatter in simulations where shot noise can be toggled off.
 
@@ -203,16 +216,20 @@ The raw DES error is `flux_err_fixed * sqrt(χ²/dof)` — it scales the fixed-t
 
 However, the noise-correlated template effect actually makes the model fit the data **too well**: the template partially overfits the noise, so χ²/dof stays near 1. The raw DES error is blind to this.
 
-To fix this, slimfarmer replaces the fixed-template baseline with the marginalized Fisher:
+To fix this, slimfarmer replaces the fixed-template baseline with the marginalized Fisher and adds the size propagation term:
 
 ```
-marg_ratio   = flux_err_marginalized / flux_err_fixed_template
-flux_err_des = flux_err_des_raw × marg_ratio
+marg_ratio   = flux_err_shot_raw / flux_err_shot_fixed
+flux_err_des = sqrt((flux_err_des_raw × marg_ratio)² + sigma_prop²)
 ```
+
+where `flux_err_shot_fixed` is the fixed-template (diagonal-only) Fisher error with shot noise, and `sigma_prop` is the same size propagation term described above.
 
 This preserves the DES chi2/dof scaling while raising the floor from the fixed-template bound to the correct marginalized bound. When the model fits well (χ²/dof ≈ 1), `flux_err_des ≈ flux_err` (the marginalized Fisher). When the model fits poorly (χ²/dof > 1), the error inflates further on top of the marginalization correction.
 
 #### Empirical validation
+
+See [`doc/Flux_error_validation_colab.ipynb`](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) for a runnable validation notebook covering both white and correlated noise scenarios.
 
 Single ExpGalaxy, mag=21, HLR=0.8", Roman H158, EXPTIME=642s, read-noise=10e, N=200 MC realizations, `noshot=True`:
 
@@ -310,6 +327,7 @@ The test runs the full pipeline on `slimfarmer_outputroman_image.fits`, cross-ma
 |---|---|
 | `doc/tutorial.ipynb` | Full walkthrough: CPR → images → photometry → diagnostics |
 | `doc/demo.ipynb` | Quick demo using pre-prepared FITS files |
+| `doc/Flux_error_validation_colab.ipynb` | Flux error validation: white vs correlated noise MC tests [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) |
 
 ```bash
 jupyter notebook slimfarmer/doc/tutorial.ipynb

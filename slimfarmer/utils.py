@@ -304,11 +304,22 @@ def get_params(model, band, zeropoint):
     marg_ratio = flux_err_shot_raw / flux_err_shot_fixed if flux_err_shot_fixed > 0 else 1.0
     flux_err_des = float(np.sqrt((flux_err_des_raw * marg_ratio) ** 2 + sigma_prop_sq))
 
+    # Correlated-noise correction from noise realizations.
+    # When noshot=True, pass background-only noise realizations.
+    # When noshot=False, pass noise realizations that include shot noise.
+    kappa = 1.0
+    if hasattr(model, 'flux_err_noisereal_kappa'):
+        kappa = model.flux_err_noisereal_kappa.get(band, 1.0)
+    flux_err_shot *= kappa
+    flux_err_noshot *= kappa
+    flux_err_des *= kappa
+
     source[f'{band}_flux'] = flux
     source[f'{band}_flux_err'] = flux_err_shot
     source[f'{band}_flux_err_des'] = flux_err_des
     source[f'{band}_flux_err_noshot'] = flux_err_noshot
     source[f'{band}_flux_err_tractor_origin'] = flux_err_tractor
+    source[f'{band}_flux_err_kappa'] = kappa
     #source[f'{band}_flux_ujy'] = flux * 10 ** (-0.4 * (zeropoint - 23.9))
     #if flux > 0:
     #    source[f'{band}_mag'] = -2.5 * np.log10(flux) + zeropoint
@@ -324,6 +335,7 @@ def prepare_images_from_cpr(cpr_path, work_dir,
                             wht_name='roman_weight.fits',
                             psf_name='PSF_F158.fits',
                             eff_gain_name='roman_eff_gain.fits',
+                            noise_reals_name='roman_noise_reals.fits',
                             pix_size= 0.11,
                             gain = 1.458,
                             exptime = 107.52398,
@@ -372,15 +384,16 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     """
     os.makedirs(work_dir, exist_ok=True)
 
-    sci_path      = os.path.join(work_dir, sci_name)
-    wht_path      = os.path.join(work_dir, wht_name)
-    psf_path      = os.path.join(work_dir, psf_name)
-    eff_gain_path = os.path.join(work_dir, eff_gain_name)
+    sci_path         = os.path.join(work_dir, sci_name)
+    wht_path         = os.path.join(work_dir, wht_name)
+    psf_path         = os.path.join(work_dir, psf_name)
+    eff_gain_path    = os.path.join(work_dir, eff_gain_name)
+    noise_reals_path = os.path.join(work_dir, noise_reals_name)
 
-    if not overwrite and all(os.path.exists(p) for p in (sci_path, wht_path, psf_path, eff_gain_path)):
+    if not overwrite and all(os.path.exists(p) for p in (sci_path, wht_path, psf_path, eff_gain_path, noise_reals_path)):
         logger = logging.getLogger('slimfarmer')
         logger.info(f'Skipping CPR preparation — all outputs exist in {work_dir}')
-        return sci_path, wht_path, psf_path, eff_gain_path
+        return sci_path, wht_path, psf_path, eff_gain_path, noise_reals_path
 
     try:
         from pyimcom.compress.compressutils import ReadFile
@@ -399,7 +412,7 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     if truth:
         sci    = cpr[0].data[0][1].astype(np.float32)
     elif realization:
-        sci    = cpr[0].data[0][1].astype(np.float32)+cpr[0].data[0][22].astype(np.float32)
+        sci    = cpr[0].data[0][1].astype(np.float32)+cpr[0].data[0][26].astype(np.float32)
     else:
         sci    = cpr[0].data[0][0].astype(np.float32)
     header = cpr[0].header
@@ -413,6 +426,11 @@ def prepare_images_from_cpr(cpr_path, work_dir,
 
     factor      = gain / (pix_size / pix_scale) ** 2
     sci         = sci * factor
+
+    # ── Noise realizations (layers 20-23) ────────────────────────────────
+    noise_reals = np.stack(
+        [cpr[0].data[0][k].astype(np.float32) for k in range(24, 28)]
+    ) * factor  # (4, Ny, Nx)
 
     # Background-only (correlated) variance — source shot noise excluded.
     # Shot noise from sources must be estimated from the model during fitting.
@@ -440,21 +458,27 @@ def prepare_images_from_cpr(cpr_path, work_dir,
         sci = sci.data
         wht = Cutout2D(wht, position, size, wcs=wcs).data
         eff_gain = Cutout2D(eff_gain, position, size, wcs=wcs).data
+        noise_reals = np.stack(
+            [Cutout2D(noise_reals[k], position, size, wcs=WCS(header, naxis=2)).data
+             for k in range(noise_reals.shape[0])]
+        )
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    fits.writeto(sci_path,      sci,      header=header, overwrite=True)
-    fits.writeto(wht_path,      wht,      header=header, overwrite=True)
-    fits.writeto(psf_path,      psf,                     overwrite=True)
-    fits.writeto(eff_gain_path, eff_gain, header=header, overwrite=True)
+    fits.writeto(sci_path,         sci,         header=header, overwrite=True)
+    fits.writeto(wht_path,         wht,         header=header, overwrite=True)
+    fits.writeto(psf_path,         psf,                        overwrite=True)
+    fits.writeto(eff_gain_path,    eff_gain,    header=header, overwrite=True)
+    fits.writeto(noise_reals_path, noise_reals, header=header, overwrite=True)
 
     logger = logging.getLogger('slimfarmer')
-    logger.info(f'Science  → {sci_path}  shape={sci.shape}')
-    logger.info(f'Weight   → {wht_path}  range=[{wht.min():.3g}, {wht.max():.3g}]  (background only)')
-    logger.info(f'Eff gain → {eff_gain_path}  range=[{eff_gain.min():.3g}, {eff_gain.max():.3g}]')
-    logger.info(f'PSF      → {psf_path}  {stamp_size}×{stamp_size}px  '
+    logger.info(f'Science     → {sci_path}  shape={sci.shape}')
+    logger.info(f'Weight      → {wht_path}  range=[{wht.min():.3g}, {wht.max():.3g}]  (background only)')
+    logger.info(f'Eff gain    → {eff_gain_path}  range=[{eff_gain.min():.3g}, {eff_gain.max():.3g}]')
+    logger.info(f'Noise reals → {noise_reals_path}  shape={noise_reals.shape}')
+    logger.info(f'PSF         → {psf_path}  {stamp_size}×{stamp_size}px  '
                 f'FWHM={psf_fwhm_arcsec:.3f}"  sum={psf.sum():.6f}')
 
-    return sci_path, wht_path, psf_path, eff_gain_path
+    return sci_path, wht_path, psf_path, eff_gain_path, noise_reals_path
 
 
 def get_detection_kernel(filter_kernel):

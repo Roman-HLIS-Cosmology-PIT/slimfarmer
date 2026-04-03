@@ -148,6 +148,7 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 | `ra`, `dec` | Sky position (deg) |
 | `x`, `y` | Pixel position |
 | `a`, `b`, `theta` | SEP shape moments |
+| `flag` | Bitwise OR of detection flags (see table below) |
 | `group_id`, `group_pop` | Group assignment and size |
 | `{band}_flux` | Fitted flux (image DN) |
 | `{band}_flux_err` | Marginalized Fisher flux uncertainty including shot noise (recommended; see below) |
@@ -161,6 +162,24 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 | `logre_dev`, `logre_dev_err` | Dev component log half-light radius and uncertainty (FixedCompositeGalaxy) |
 | `ee1_err`, `ee2_err` | Ellipticity component uncertainties from model selection |
 | `total_rchisq` | Reduced chi² of forced photometry |
+
+### Detection flags
+
+The `flag` column is a bitwise OR of the following values:
+
+| Bit | Value | Description |
+|---|---|---|
+| 0 | 1 | Object has neighbors (SEP) |
+| 1 | 2 | Object was blended with another (SEP) |
+| 2 | 4 | At least one pixel saturated or exceeds a threshold (SEP) |
+| 3 | 8 | Object is truncated at the image boundary (SEP) |
+| 4 | 16 | Object's aperture data are incomplete or corrupted (SEP) |
+| 5 | 32 | Object's isophotal data are incomplete or corrupted (SEP) |
+| 6 | 64 | Memory overflow during deblending (SEP) |
+| 7 | 128 | Memory overflow during extraction (SEP) |
+| 8 | 256 (`0x0100`) | Object center is within `paddingpixel` pixels of the image boundary (slimfarmer) |
+
+Bits 0–7 are set by SEP during source extraction. Bit 8 is set by slimfarmer to flag detections whose centroid falls within `config.paddingpixel` (default 34) pixels of any image edge. To check for boundary sources: `catalog['flag'] & 0x0100 != 0`.
 
 ### Flux error columns
 

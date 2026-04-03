@@ -313,8 +313,12 @@ class _Group:
         try:
             for i in range(self.config.max_steps):
                 self._update_invvar_with_model()
-                dlnp, X, alpha, var = self.engine.optimize(
-                    variance=True, damping=self.config.damping, priors=True)
+                try:
+                    dlnp, X, alpha, var = self.engine.optimize(
+                        variance=True, damping=self.config.damping, priors=True)
+                except (IndexError, np.linalg.LinAlgError):
+                    self.logger.debug('Optimizer failed — skipping group')
+                    return False
                 if dlnp < self.config.dlnp_crit:
                     break
             if var is None:
@@ -598,45 +602,27 @@ class _Group:
         return True
 
     def _compute_des_flux_err(self):
-        """Compute DES-style flux error from pixel residuals (MOF afterburner approach).
+        """Compute DES/ngmix-style flux error: scale Fisher covariance by chi2/dof.
 
-        Mirrors mof/moflib.py:L1373 (esheldon/mof), restricted to each source's
-        model footprint (model_i > 1e-3 × peak) and using the full invvar
-        (background + model Poisson, from _update_invvar_with_model).
+        Following ngmix (esheldon/ngmix leastsqbound.py + results.py):
+          1. Compute residuals fdiff = (data - model) * sqrt(invvar)
+          2. s_sq = sum(fdiff^2) / dof, where dof = n_pixels - n_params
+          3. pcov_scaled = pcov0 * s_sq  (pcov0 = Fisher inverse)
+          4. flux_err_des = sqrt(pcov_scaled[flux_idx, flux_idx])
 
-        Why footprint: the group fitting region is much larger than a MOF stamp,
-        so background pixels (model≈0) dilute chi2/dof → 1 regardless of noise.
-        Why full invvar (not invvar_bg): with invvar_bg, chi2/dof gives an
-        unweighted average of σ_tot²/σ_bg² while the matched filter ψ²-weights
-        those noisy center pixels, causing a systematic flux_err_des ~ 0.8×flux_err_tractor.
-        With full invvar, chi2/dof ≈ 1 for a perfect fit → flux_err_des ≈ flux_err_tractor,
-        and any model error / neighbour contamination raises chi2/dof > 1 →
-        flux_err_des > flux_err_tractor.
+        This is equivalent to: flux_err_des = sqrt(chi2/dof) * flux_err_fisher.
+        It accounts for model mismatch, neighbor contamination, and PSF errors
+        by inflating the Fisher error when chi2/dof > 1.
 
-        For each source i and band b:
-            footprint = pixels where model_i > 1e-3 × max(model_i)
-            chi2    = sum over footprint of (data - model_total)^2 * invvar
-            msq_sum = sum over footprint of invvar * (model_i / flux_i)^2
-            dof     = n_footprint_pixels - 1
-            flux_err_des = sqrt(chi2 / msq_sum / dof)
+        Restricted to the source footprint (model > 1e-2 * peak) to avoid
+        diluting chi2/dof with background pixels in the larger group region.
         """
         if self.engine is None or not self.images:
             return
 
-        nobj = len(self.source_ids)
-
         for ib, (band, img) in enumerate(self.images.items()):
             model_total = self.engine.getModelImage(ib)
-            # Use img.invvar (background + model Poisson, updated by
-            # _update_invvar_with_model).  For a perfect fit chi2/dof ≈ 1 and
-            # flux_err_des ≈ flux_err_tractor; any model error, neighbour
-            # contamination, or PSF mismatch drives chi2/dof > 1 so that
-            # flux_err_des > flux_err_tractor.  Using invvar_bg instead causes
-            # the unweighted chi2/dof to underestimate shot noise (shot noise is
-            # ψ²-weighted in the MF but averaged uniformly in chi2), yielding a
-            # systematic flux_err_des/flux_err_tractor ~ 0.8.
             invvar = img.invvar
-            chi_image = (img.data - model_total) * np.sqrt(invvar)
 
             for sid in self.source_ids:
                 if sid not in self.model_catalog:
@@ -657,15 +643,9 @@ class _Group:
                 src_copy = copy.deepcopy(model)
                 temp_engine = Tractor([img], [src_copy])
                 temp_engine.bands = [band]
+                temp_engine.freezeParam('images')
                 model_img = temp_engine.getModelImage(0)
 
-                # Restrict to the model footprint so that background-dominated
-                # pixels (model ≈ 0) do not dilute chi2/dof toward 1 and wash
-                # out the shot-noise signal.  In MOF each source has its own
-                # small stamp so N_pix ≈ N_eff; here the group fitting region
-                # is much larger, making the full-region chi2/dof ≈ 1 regardless
-                # of shot noise → flux_err_des < flux_err_tractor (wrong).
-                # Masking to the PSF footprint restores chi2/dof ≈ σ_tot²/σ_bg².
                 model_peak = float(np.max(model_img))
                 if model_peak <= 0:
                     model.flux_err_des[band] = 0.0
@@ -678,17 +658,71 @@ class _Group:
                     model.flux_err_des[band] = 0.0
                     continue
 
-                chi2 = float(np.sum(chi_image[footprint][valid] ** 2))
-                msq_sum = float(np.sum(invvar_foot[valid]
-                                       * (model_img[footprint][valid] / flux) ** 2))
-                ndof = max(1, int(np.sum(valid)) - 1)
+                # chi2 on footprint
+                fdiff = (img.data[footprint][valid] - model_total[footprint][valid]) * np.sqrt(invvar_foot[valid])
+                chi2 = float(np.sum(fdiff ** 2))
 
-                if msq_sum <= 0:
-                    model.flux_err_des[band] = 0.0
+                # dof = n_pixels - n_params (ngmix convention)
+                n_params = len(src_copy.getParams())
+                n_pix = int(np.sum(valid))
+                dof = max(1, n_pix - n_params)
+
+                # s_sq = chi2 / dof (ngmix scaling factor)
+                s_sq = chi2 / dof
+
+                # Fisher inverse on footprint (marginalized over all params)
+                p0 = np.array(src_copy.getParams())
+                if len(p0) == 0:
+                    unit_t = model_img[footprint][valid] / flux
+                    F_ff = float(np.sum(invvar_foot[valid] * unit_t ** 2))
+                    model.flux_err_des[band] = float(np.sqrt(s_sq / F_ff)) if F_ff > 0 else 0.0
                     continue
 
-                arg = chi2 / msq_sum / ndof
-                model.flux_err_des[band] = float(np.sqrt(arg)) if arg > 0 else 0.0
+                step_sizes = np.array(src_copy.getStepSizes())
+                w = invvar_foot[valid]
+                derivs = np.zeros((len(p0), len(w)))
+                for ip in range(len(p0)):
+                    dp = max(step_sizes[ip], 1e-10)
+                    pp = p0.copy(); pp[ip] += dp
+                    src_copy.setParams(pp)
+                    mp = temp_engine.getModelImage(0)[footprint][valid]
+                    pm = p0.copy(); pm[ip] -= dp
+                    src_copy.setParams(pm)
+                    mm = temp_engine.getModelImage(0)[footprint][valid]
+                    derivs[ip] = (mp - mm) / (2.0 * dp)
+                    src_copy.setParams(p0)
+
+                # Fisher matrix: F_ij = sum(w * d_i * d_j)
+                fisher = np.zeros((len(p0), len(p0)))
+                for i in range(len(p0)):
+                    for j in range(i, len(p0)):
+                        val = float(np.sum(w * derivs[i] * derivs[j]))
+                        fisher[i, j] = val
+                        fisher[j, i] = val
+
+                if hasattr(src_copy, 'getLogPriorDerivatives'):
+                    try:
+                        for ip, (_, _, dd) in enumerate(src_copy.getLogPriorDerivatives()):
+                            fisher[ip, ip] += max(-dd, 0.0)
+                    except Exception:
+                        pass
+
+                flux_idx = None
+                param_names = src_copy.getParamNames()
+                for ip, pn in enumerate(param_names):
+                    if band in pn or pn.startswith('brightness'):
+                        flux_idx = ip
+                        break
+                if flux_idx is None:
+                    flux_idx = 0
+
+                try:
+                    # pcov_scaled = inv(Fisher) * s_sq  (ngmix convention)
+                    cov = np.linalg.inv(fisher) * s_sq
+                    flux_var = max(cov[flux_idx, flux_idx], 0.0)
+                    model.flux_err_des[band] = float(np.sqrt(flux_var))
+                except np.linalg.LinAlgError:
+                    model.flux_err_des[band] = 0.0
 
     def _get_shape_var(self, variance_obj):
         """Return {attr: deepcopy(attr)} for shape sub-objects in a variance model."""
@@ -857,6 +891,57 @@ class _Group:
             self._compute_marginal_fisher_flux_err(
                 band, img, invvar_total, 'flux_err_shot_raw')
 
+    def _cache_kappa_data(self):
+        """Cache compact h data per source for compute_kappa() in FarmerImage.
+
+        Only stores 1D arrays (h_vals, nzy, nzx) and scalar D — NOT the
+        large pairwise dy/dx matrices, to keep pickle size small.
+        """
+        if self.engine is None or not self.images:
+            return
+
+        for ib, (band, img) in enumerate(self.images.items()):
+            invvar_bg = self.band_data[band].get('invvar_bg')
+            if invvar_bg is None:
+                continue
+
+            for sid in self.source_ids:
+                if sid not in self.model_catalog:
+                    continue
+                model = self.model_catalog[sid]
+                if not hasattr(model, '_kappa_cache'):
+                    model._kappa_cache = {}
+
+                try:
+                    flux = float(model.getBrightness().getFlux(band))
+                except Exception:
+                    flux = 0.0
+                if flux == 0.0:
+                    continue
+
+                src_copy = copy.deepcopy(model)
+                temp_engine = Tractor([img], [src_copy])
+                temp_engine.bands = [band]
+                temp_engine.freezeParam('images')
+                unit_t = temp_engine.getModelImage(0) / flux
+
+                D = float(np.sum(invvar_bg * unit_t ** 2))
+                if D <= 0:
+                    continue
+
+                h = np.sqrt(invvar_bg) * unit_t
+                nzy, nzx = np.nonzero(h)
+                if len(nzy) == 0:
+                    continue
+
+                model._kappa_cache[band] = {
+                    'h_vals': h[nzy, nzx].astype(np.float32),
+                    'nzy': nzy.astype(np.int16),
+                    'nzx': nzx.astype(np.int16),
+                    'D': D,
+                }
+
+
     def _compute_marginal_fisher_flux_err(self, band, img, invvar, attr_name):
         """Shared logic: build Fisher matrix with given invvar, extract flux err.
 
@@ -1004,6 +1089,7 @@ class _Group:
         self._compute_flux_err_corr()
         self._compute_flux_err_noshot()
         self._compute_flux_err_shot()
+        self._cache_kappa_data()
         return True
 
 
@@ -1013,9 +1099,12 @@ def _process_group(group):
     """Determine models + force photometry for a group; return serialisable result."""
     tstart = time.time()
     if not group.rejected:
-        ok = group.determine_models()
-        if ok:
-            group.force_models()
+        try:
+            ok = group.determine_models()
+            if ok:
+                group.force_models()
+        except Exception:
+            pass
     elapsed = time.time() - tstart
     for sid in group.source_ids:
         if sid in group.model_tracker:

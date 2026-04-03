@@ -21,12 +21,12 @@ from collections import OrderedDict
 from tractor import PixelizedPSF, PixelizedPsfEx, HybridPixelizedPSF
 import tqdm as _tqdm
 
-try:
-    from pathos.pools import ProcessPool
-    HAS_PATHOS = True
-except ImportError:
-    HAS_PATHOS = False
-    import multiprocessing
+#try:
+#    from pathos.pools import ProcessPool
+#    HAS_PATHOS = True
+#except ImportError:
+HAS_PATHOS = False
+import multiprocessing
 
 from ._group import _Group, _process_group, _process_group_second_pass
 from .utils import (clean_catalog, dilate_and_group, get_detection_kernel,
@@ -101,6 +101,8 @@ class FarmerImage:
             else:
                 eff_gain = None
 
+            noise_reals_path = bconf.get('noise_reals')
+
             psf_path = bconf['psf']
             if psf_path.endswith('.psf'):
                 try:
@@ -120,13 +122,39 @@ class FarmerImage:
             sci[bad] = 0.
             wht[~np.isfinite(wht) | (wht < 0) | bad] = 0.
 
+            # Precompute noise correlation r(dx,dy) once from full image
+            noise_corr = None
+            if noise_reals_path is not None:
+                ny_f, nx_f = sci.shape
+                # Estimate per-pixel sigma directly from the noise realizations.
+                # This avoids unit mismatch between noise layers and weight map.
+                with fits.open(noise_reals_path) as hdul:
+                    nr_all = hdul[0].data.astype(np.float64)
+                sigma_nr = np.std(nr_all, axis=0, ddof=1)
+                # Smooth to reduce noise from few realizations
+                from scipy.ndimage import uniform_filter
+                sigma_nr = uniform_filter(sigma_nr, size=15)
+                sigma_nr = np.where(sigma_nr > 0, sigma_nr, 1.0)
+
+                n_real = nr_all.shape[0]
+                R_2d = np.zeros((ny_f, nx_f), dtype=np.float64)
+                for k in range(n_real):
+                    n_norm = nr_all[k] / sigma_nr
+                    R_2d += np.abs(np.fft.fft2(n_norm)) ** 2
+                    del n_norm
+                R_2d /= n_real
+                noise_corr = np.fft.ifft2(R_2d).real / (ny_f * nx_f)
+                del R_2d, nr_all, sigma_nr
+
             self.band_config[band] = {
-                'science':   sci,
-                'weight':    wht,
-                'eff_gain':  eff_gain,
-                'mask':      (wht <= 0) | ~np.isfinite(sci),
-                'psf_model': psf_model,
-                'zeropoint': bconf['zeropoint'],
+                'science':          sci,
+                'weight':           wht,
+                'eff_gain':         eff_gain,
+                'noise_corr':       noise_corr,
+                'noise_reals_path': noise_reals_path,
+                'mask':             (wht <= 0) | ~np.isfinite(sci),
+                'psf_model':        psf_model,
+                'zeropoint':        bconf['zeropoint'],
             }
 
         # Shared base mask from detection band
@@ -395,27 +423,35 @@ class FarmerImage:
                 g = self._spawn_group(gid)
                 self._absorb(_process_group(g))
         else:
-            if HAS_PATHOS:
-                # Prevent BLAS/OpenMP thread oversubscription inside workers
-                import os as _os
-                for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
-                             'MKL_NUM_THREADS', 'BLAS_NUM_THREADS'):
-                    _os.environ.setdefault(_var, '1')
-                groups = (_spawn_and_process(self, gid) for gid in group_ids)
-                with ProcessPool(ncpus=self.config.ncpus) as pool:
-                    pool.restart()
-                    for result in _tqdm.tqdm(
-                            pool.imap(_process_group, groups, chunksize=1),
-                            total=len(group_ids), desc='Groups'):
-                        self._absorb(result)
-            else:
-                import multiprocessing as mp
-                groups = [self._spawn_group(gid) for gid in group_ids]
-                with mp.Pool(processes=self.config.ncpus) as pool:
-                    for result in _tqdm.tqdm(
-                            pool.imap(_process_group, groups),
-                            total=len(groups), desc='Groups'):
-                        self._absorb(result)
+            import os as _os
+            for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                         'MKL_NUM_THREADS', 'BLAS_NUM_THREADS'):
+                _os.environ.setdefault(_var, '1')
+            import multiprocessing as mp
+            saved = {}
+            for band in self.band_config:
+                saved[band] = {}
+                for key in ('noise_corr', 'noise_reals_path'):
+                    saved[band][key] = self.band_config[band].pop(key, None)
+            groups = [self._spawn_group(gid) for gid in group_ids]
+            pool = mp.Pool(processes=self.config.ncpus, maxtasksperchild=20)
+            async_results = [pool.apply_async(_process_group, (g,)) for g in groups]
+            pool.close()
+            pbar = _tqdm.tqdm(total=len(groups), desc='Groups')
+            for ar in async_results:
+                try:
+                    result = ar.get(timeout=120)
+                    self._absorb(result)
+                except Exception:
+                    pass
+                pbar.update(1)
+            pbar.close()
+            pool.terminate()
+            pool.join()
+            for band in self.band_config:
+                for key, val in saved[band].items():
+                    if val is not None:
+                        self.band_config[band][key] = val
 
         self.logger.info(f'Finished — {len(self.model_catalog)} sources fit.')
 
@@ -434,35 +470,65 @@ class FarmerImage:
                     result = _process_group_second_pass((g2, neighboring, pass1))
                     self._absorb(result)
             else:
-                if HAS_PATHOS:
-                    args_list = []
-                    for gid in group_ids:
-                        g2 = self._spawn_group(gid)
-                        neighboring = self._get_nearby_models(gid, radius_deg)
-                        pass1 = {sid: pass1_catalog[sid]
-                                 for sid in g2.source_ids if sid in pass1_catalog}
-                        args_list.append((g2, neighboring, pass1))
-                    with ProcessPool(ncpus=self.config.ncpus) as pool:
-                        pool.restart()
-                        for result in _tqdm.tqdm(
-                                pool.imap(_process_group_second_pass, args_list,
-                                          chunksize=1),
-                                total=len(args_list), desc='Neighbors'):
-                            self._absorb(result)
-                else:
-                    args_list = []
-                    for gid in group_ids:
-                        g2 = self._spawn_group(gid)
-                        neighboring = self._get_nearby_models(gid, radius_deg)
-                        pass1 = {sid: pass1_catalog[sid]
-                                 for sid in g2.source_ids if sid in pass1_catalog}
-                        args_list.append((g2, neighboring, pass1))
-                    with mp.Pool(processes=self.config.ncpus) as pool:
-                        for result in _tqdm.tqdm(
-                                pool.imap(_process_group_second_pass, args_list),
-                                total=len(args_list), desc='Neighbors'):
-                            self._absorb(result)
+                args_list = []
+                for gid in group_ids:
+                    g2 = self._spawn_group(gid)
+                    neighboring = self._get_nearby_models(gid, radius_deg)
+                    pass1 = {sid: pass1_catalog[sid]
+                             for sid in g2.source_ids if sid in pass1_catalog}
+                    args_list.append((g2, neighboring, pass1))
+                with mp.Pool(processes=self.config.ncpus,
+                             maxtasksperchild=50) as pool:
+                    for result in _tqdm.tqdm(
+                            pool.imap(_process_group_second_pass, args_list),
+                            total=len(args_list), desc='Neighbors'):
+                        self._absorb(result)
             self.logger.info(f'Neighbor pass done — {len(self.model_catalog)} sources.')
+
+    # ── Post-fit correlated-noise kappa ─────────────────────────────────────
+
+    def compute_kappa(self):
+        """Compute kappa using cached h data.
+
+        For noshot=True: uses noise_corr from init (sigma_bg, exact).
+        For noshot=False: re-estimates r with sigma_total, one band at
+        a time, freeing memory between bands.
+        """
+        import gc
+
+        for band in self.bands:
+            bc = self.band_config[band]
+            noise_corr = bc.get('noise_corr')
+            if noise_corr is None:
+                continue
+            ny, nx = noise_corr.shape
+
+            # noise_corr from init already uses sigma estimated from
+            # the realizations themselves, so no re-estimation needed.
+
+            for source_id, model in self.model_catalog.items():
+                if not hasattr(model, 'flux_err_noisereal_kappa'):
+                    model.flux_err_noisereal_kappa = {}
+
+                cache = getattr(model, '_kappa_cache', {}).get(band)
+                if cache is None:
+                    model.flux_err_noisereal_kappa[band] = 1.0
+                    continue
+
+                h_vals = cache['h_vals'].astype(np.float64)
+                nzy = cache['nzy'].astype(np.intp)
+                nzx = cache['nzx'].astype(np.intp)
+                D = cache['D']
+
+                dy = nzy[:, None] - nzy[None, :]
+                dx = nzx[:, None] - nzx[None, :]
+                r_vals = noise_corr[dy % ny, dx % nx]
+                hTRh = float(np.sum(h_vals[:, None] * r_vals * h_vals[None, :]))
+
+                kappa_sq = hTRh / D
+                model.flux_err_noisereal_kappa[band] = np.sqrt(max(kappa_sq, 1.0))
+
+            del noise_corr; gc.collect()
 
     # ── Build catalog ─────────────────────────────────────────────────────────
 
@@ -571,7 +637,8 @@ def _spawn_and_process(farmer, gid):
 # ── Convenience top-level function ────────────────────────────────────────────
 
 def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
-                   weight_path=None, eff_gain_path=None, bands=None,
+                   weight_path=None, eff_gain_path=None, noise_reals_path=None,
+                   bands=None,
                    detection_band=None, output_path=None, group_ids=None,
                    config=None, **config_kwargs):
     """
@@ -604,7 +671,8 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
                 "science_path, psf_path, band, zeropoint")
         bands = {band: {'science': science_path, 'psf': psf_path,
                         'zeropoint': zeropoint, 'weight': weight_path,
-                        'eff_gain': eff_gain_path}}
+                        'eff_gain': eff_gain_path,
+                        'noise_reals': noise_reals_path}}
 
     if config is None:
         config = Config(**config_kwargs)
@@ -618,6 +686,10 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
     img = FarmerImage(bands, detection_band=detection_band, config=config)
     img.detect()
     img.process_groups(group_ids=group_ids)
+    logger = logging.getLogger('slimfarmer')
+    logger.info('All groups done. Computing kappa...')
+    img.compute_kappa()
+    logger.info('Kappa done. Building catalog...')
     cat = img.build_catalog()
     if output_path is not None:
         cat.write(output_path, overwrite=True)
@@ -634,4 +706,4 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
             fits.writeto(base + suffix + '_residual.fits', residual,                     header=hdr, overwrite=True)
             logger.info(f'Model    → {base}{suffix}_model.fits')
             logger.info(f'Residual → {base}{suffix}_residual.fits')
-    return cat
+    return cat, img

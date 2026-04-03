@@ -24,6 +24,8 @@ class Config:
     group_buffer = 0.01 * u.arcsec
     group_size_limit = 10
     fit_dilation_radius = 0.2 * u.arcsec  # expand fitting region beyond groupmap to capture profile wings
+    timeout=1200
+    paddingpixel = 34
 
     # Background
     subtract_background = False

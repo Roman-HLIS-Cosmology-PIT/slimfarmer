@@ -602,20 +602,26 @@ class _Group:
         return True
 
     def _compute_des_flux_err(self):
-        """Compute DES/ngmix-style flux error: scale Fisher covariance by chi2/dof.
+        """Compute DES/ngmix-style flux error: scale Tractor Fisher variance by chi2/dof.
 
-        Following ngmix (esheldon/ngmix leastsqbound.py + results.py):
-          1. Compute residuals fdiff = (data - model) * sqrt(invvar)
-          2. s_sq = sum(fdiff^2) / dof, where dof = n_pixels - n_params
-          3. pcov_scaled = pcov0 * s_sq  (pcov0 = Fisher inverse)
-          4. flux_err_des = sqrt(pcov_scaled[flux_idx, flux_idx])
+        The Tractor optimizer (like scipy.optimize.leastsq) returns the
+        Fisher inverse inv(J^T J) as the parameter covariance. This
+        assumes the residual variance is exactly 1 (i.e., the noise
+        model is perfect). When the model is imperfect — due to PSF
+        mismatch, neighbor contamination, or incorrect noise model —
+        the actual residual variance s^2 = chi2/dof differs from 1.
 
-        This is equivalent to: flux_err_des = sqrt(chi2/dof) * flux_err_fisher.
-        It accounts for model mismatch, neighbor contamination, and PSF errors
-        by inflating the Fisher error when chi2/dof > 1.
+        The correct parameter covariance is (scipy docs, ngmix):
+            Cov(params) = inv(J^T J) * s^2
 
-        Restricted to the source footprint (model > 1e-2 * peak) to avoid
-        diluting chi2/dof with background pixels in the larger group region.
+        So: flux_err_des = sqrt(s^2) * flux_err_tractor
+
+        When chi2/dof ~ 1 (good fit): flux_err_des ~ flux_err_tractor.
+        When chi2/dof > 1 (bad fit):   flux_err_des > flux_err_tractor.
+
+        Following ngmix (esheldon/ngmix leastsqbound.py:L106, results.py:L869).
+        Restricted to the source footprint (model > 1e-2 * peak) to
+        avoid diluting chi2/dof with background pixels.
         """
         if self.engine is None or not self.images:
             return
@@ -633,17 +639,18 @@ class _Group:
 
                 try:
                     flux = model.getBrightness().getFlux(band)
+                    flux_var = model.variance.getBrightness().getFlux(band)
+                    flux_err_tractor = np.sqrt(abs(flux_var)) if flux_var > 0 else 0.0
                 except Exception:
-                    flux = 0.0
+                    flux, flux_err_tractor = 0.0, 0.0
 
-                if flux == 0.0:
+                if flux == 0.0 or flux_err_tractor == 0.0:
                     model.flux_err_des[band] = 0.0
                     continue
 
                 src_copy = copy.deepcopy(model)
                 temp_engine = Tractor([img], [src_copy])
                 temp_engine.bands = [band]
-                temp_engine.freezeParam('images')
                 model_img = temp_engine.getModelImage(0)
 
                 model_peak = float(np.max(model_img))
@@ -659,70 +666,18 @@ class _Group:
                     continue
 
                 # chi2 on footprint
-                fdiff = (img.data[footprint][valid] - model_total[footprint][valid]) * np.sqrt(invvar_foot[valid])
+                fdiff = (img.data[footprint][valid] - model_total[footprint][valid]) \
+                        * np.sqrt(invvar_foot[valid])
                 chi2 = float(np.sum(fdiff ** 2))
 
                 # dof = n_pixels - n_params (ngmix convention)
-                n_params = len(src_copy.getParams())
+                n_params = len(model.getParams())
                 n_pix = int(np.sum(valid))
                 dof = max(1, n_pix - n_params)
 
-                # s_sq = chi2 / dof (ngmix scaling factor)
+                # flux_err_des = sqrt(chi2/dof) * flux_err_tractor
                 s_sq = chi2 / dof
-
-                # Fisher inverse on footprint (marginalized over all params)
-                p0 = np.array(src_copy.getParams())
-                if len(p0) == 0:
-                    unit_t = model_img[footprint][valid] / flux
-                    F_ff = float(np.sum(invvar_foot[valid] * unit_t ** 2))
-                    model.flux_err_des[band] = float(np.sqrt(s_sq / F_ff)) if F_ff > 0 else 0.0
-                    continue
-
-                step_sizes = np.array(src_copy.getStepSizes())
-                w = invvar_foot[valid]
-                derivs = np.zeros((len(p0), len(w)))
-                for ip in range(len(p0)):
-                    dp = max(step_sizes[ip], 1e-10)
-                    pp = p0.copy(); pp[ip] += dp
-                    src_copy.setParams(pp)
-                    mp = temp_engine.getModelImage(0)[footprint][valid]
-                    pm = p0.copy(); pm[ip] -= dp
-                    src_copy.setParams(pm)
-                    mm = temp_engine.getModelImage(0)[footprint][valid]
-                    derivs[ip] = (mp - mm) / (2.0 * dp)
-                    src_copy.setParams(p0)
-
-                # Fisher matrix: F_ij = sum(w * d_i * d_j)
-                fisher = np.zeros((len(p0), len(p0)))
-                for i in range(len(p0)):
-                    for j in range(i, len(p0)):
-                        val = float(np.sum(w * derivs[i] * derivs[j]))
-                        fisher[i, j] = val
-                        fisher[j, i] = val
-
-                if hasattr(src_copy, 'getLogPriorDerivatives'):
-                    try:
-                        for ip, (_, _, dd) in enumerate(src_copy.getLogPriorDerivatives()):
-                            fisher[ip, ip] += max(-dd, 0.0)
-                    except Exception:
-                        pass
-
-                flux_idx = None
-                param_names = src_copy.getParamNames()
-                for ip, pn in enumerate(param_names):
-                    if band in pn or pn.startswith('brightness'):
-                        flux_idx = ip
-                        break
-                if flux_idx is None:
-                    flux_idx = 0
-
-                try:
-                    # pcov_scaled = inv(Fisher) * s_sq  (ngmix convention)
-                    cov = np.linalg.inv(fisher) * s_sq
-                    flux_var = max(cov[flux_idx, flux_idx], 0.0)
-                    model.flux_err_des[band] = float(np.sqrt(flux_var))
-                except np.linalg.LinAlgError:
-                    model.flux_err_des[band] = 0.0
+                model.flux_err_des[band] = float(np.sqrt(s_sq) * flux_err_tractor)
 
     def _get_shape_var(self, variance_obj):
         """Return {attr: deepcopy(attr)} for shape sub-objects in a variance model."""

@@ -232,6 +232,12 @@ class FarmerImage:
         catalog.add_column(group_pops, name='group_pop', index=4)
         catalog.add_column(np.ones(len(catalog), dtype=np.int32), name='brick_id', index=0)
 
+        ny, nx = img.shape
+        pad = cfg.paddingpixel
+        near_boundary = ((catalog['x'] < pad) | (catalog['x'] >= nx - pad) |
+                         (catalog['y'] < pad) | (catalog['y'] >= ny - pad))
+        catalog['flag'][near_boundary] |= 0x0100
+
         self.catalog = catalog
         self.segmap = segmap
         self.groupmap = groupmap
@@ -440,7 +446,7 @@ class FarmerImage:
             pbar = _tqdm.tqdm(total=len(groups), desc='Groups')
             for ar in async_results:
                 try:
-                    result = ar.get(timeout=120)
+                    result = ar.get(timeout=self.config.timeout)
                     self._absorb(result)
                 except Exception:
                     pass

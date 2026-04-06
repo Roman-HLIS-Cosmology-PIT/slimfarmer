@@ -1,28 +1,20 @@
 # slimfarmer
-Simpler version of the farmer which combines SEP for detection and Tractor for photometry measurement
 
-Detection (SEP) → grouping → model selection → forced photometry, with optional neighbor subtraction for crowded fields.
+A streamlined multi-band photometry pipeline that uses **SEP** for source detection and **Tractor** for PSF/galaxy model fitting, with correlated-noise corrections derived from noise realizations. Designed for Roman IMCOM coadds and inspired by [The Farmer](https://github.com/astroweaver/the_farmer) (Weaver et al. 2023).
 
-  1. Detection (SEP) — run once, not iterative
+For algorithmic details, derivations, and validation results, see [`docs/research_note.md`](docs/research_note.md).
 
-  SEP (Source Extractor in Python) is called a single time to produce a source catalog and segmentation map. There is no iterative detection, no source subtraction loop, and no re-detection. The output is a fixed list of positions and a per-pixel segmentation map assigning each
-  detected pixel to a source.
+---
 
-  2. Grouping
+## Pipeline overview
 
-  Sources whose segmaps overlap (after dilation by dilation_radius = 0.07") are placed into the same group and co-fitted simultaneously. This prevents Tractor from ignoring neighbors when fitting a blended source. A separate, larger dilation (fit_dilation_radius = 0.24") defines the
-  pixel footprint Tractor actually sees — large enough to capture profile wings without merging distant sources into oversized groups.
+1. **Detection** — single SEP pass produces a source catalog and segmentation map (no iterative re-detection).
+2. **Grouping** — overlapping segmaps (after dilation) are co-fitted as a group to handle blends.
+3. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model.
+4. **Forced photometry** — morphology is frozen and only flux is refit; optional second pass subtracts neighbor models.
+5. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations.
 
-  3. Model selection
-
-  For each group, Tractor tries a sequence of increasingly complex models: PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy. It selects the simplest model whose reduced chi² is acceptable.
-
-  4. Forced photometry
-
-  With morphology fixed to the best model, Tractor re-fits only the flux of every source. Optionally (neighbor_subtraction = True), nearby group models are subtracted from the data before the final flux measurement to reduce cross-contamination.
-
-
-
+---
 
 ## Installation
 
@@ -31,8 +23,8 @@ cd slimfarmer
 pip install -e .
 ```
 
-Requires: `numpy`, `astropy>=5.0`, `scipy`, `sep`, `tqdm`, `tractor`.
-Optional: `pathos` (parallel processing), `galsim` (flux unit conversion).
+**Required:** `numpy`, `astropy>=5.0`, `scipy`, `sep`, `tqdm`, `tractor`
+**Optional:** `pathos` (parallel), `galsim` (flux unit conversion), `pyimcom` (CPR file reading)
 
 ---
 
@@ -44,82 +36,50 @@ Optional: `pathos` (parallel processing), `galsim` (flux unit conversion).
 import slimfarmer
 
 cat = slimfarmer.run_photometry(
-    science_path = 'roman_image.fits',
-    weight_path  = 'roman_weight.fits',
-    psf_path     = 'PSF_F158.fits',
-    band         = 'F158',
-    zeropoint    = 26.511,
-    output_path  = 'catalog.fits',   # optional
-    ncpus        = 8,                # 0 = serial
+    science_path='roman_image.fits',
+    weight_path ='roman_weight.fits',
+    psf_path    ='PSF_F158.fits',
+    band        ='F158',
+    zeropoint   =26.511,
+    output_path ='catalog.fits',
+    ncpus       =8,
 )
-print(cat['id', 'ra', 'dec', 'F158_flux', 'F158_flux_err', 'name'])
 ```
 
 ### Multi-band
-Have not tested yet
 
 ```python
 cat = slimfarmer.run_photometry(
     bands={
         'F158': {'science': 'F158.fits', 'weight': 'F158_wht.fits',
-                 'psf': 'F158_psf.fits', 'zeropoint': 26.511},
+                 'psf': 'F158_psf.fits', 'zeropoint': 26.511,
+                 'noise_reals': 'F158_nr.fits'},
         'F106': {'science': 'F106.fits', 'weight': 'F106_wht.fits',
-                 'psf': 'F106_psf.fits', 'zeropoint': 26.310},
+                 'psf': 'F106_psf.fits', 'zeropoint': 26.310,
+                 'noise_reals': 'F106_nr.fits'},
     },
-    detection_band = 'F158',
-    output_path    = 'catalog.fits',
+    detection_band='F158',
+    output_path   ='catalog.fits',
+    ncpus         =16,
 )
 ```
 
 ### Custom configuration
 
 ```python
-from slimfarmer import Config
+import astropy.units as u
 
-cfg = slimfarmer.run_photometry(
+cat = slimfarmer.run_photometry(
     ...,
-    config = slimfarmer.Config(
-        thresh             = 8.0,
-        dilation_radius    = 0.07 * u.arcsec,
-        fit_dilation_radius= 0.24 * u.arcsec,
-        neighbor_subtraction = True,
-        ncpus              = 48,
+    config=slimfarmer.Config(
+        thresh              =3.0,
+        dilation_radius     =0.2 * u.arcsec,
+        fit_dilation_radius =0.2 * u.arcsec,
+        neighbor_subtraction=True,
+        ncpus               =16,
     ),
 )
 ```
-
----
-
-## Improvements over The Farmer
-
-slimfarmer is a streamlined reimplementation of [The Farmer](https://github.com/astroweaver/the_farmer) (Weaver et al. 2023) with several algorithmic improvements motivated by Roman IMCOM image characteristics.
-
-### 1. Decoupled grouping and fitting regions
-
-**The Farmer** uses a single dilation radius for two distinct purposes: deciding which sources to co-fit simultaneously (grouping) and defining the pixel footprint used for fitting (the fitting region). A large dilation correctly captures profile wings in the fit but also chains together distant sources into oversized groups, causing optimizer failures.
-
-**slimfarmer** separates these with two independent parameters:
-
-| Parameter | Purpose |
-|---|---|
-| `dilation_radius = 0.07"` | Grouping only — which sources are co-fitted |
-| `fit_dilation_radius = 0.24"` | Fitting footprint — how many pixels Tractor sees |
-
-This allows Tractor to fit profile wings (needed for correct flux normalization) without merging distant sources into unstable multi-source groups.
-
-**Why it matters**: a DevGalaxy (de Vaucouleurs) fit restricted to the compact segmap (~0.42" radius) sees only ~55% of the model flux within the fitting region. Tractor compensates by inflating the total amplitude, causing ~55% flux overestimation. With `fit_dilation_radius = 0.24"`, the fitting footprint extends to ~0.9" radius, capturing ~90% of the profile and reducing the bias to <5%.
-
-### 2. Neighbor subtraction
-
-When `fit_dilation_radius` is large, the expanded fitting footprint of one group overlaps pixels belonging to sources in neighboring groups. Those neighbors are not included in the current group's Tractor fit, so their flux is absorbed by the target source.
-
-slimfarmer resolves this with an optional two-pass approach (`neighbor_subtraction = True`):
-
-1. **Pass 1** — fit all groups normally with the expanded footprint → approximate models for every source
-2. **Pass 2** — for each group, subtract PSF-convolved model images of nearby sources (from other groups) from the data, then re-run forced photometry
-
-This cleanly removes cross-group contamination from the expanded fitting region.
-
 
 ---
 
@@ -127,216 +87,136 @@ This cleanly removes cross-group contamination from the expanded fitting region.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `thresh` | `8.0` | SEP detection threshold (× background RMS) |
-| `minarea` | `4` | Minimum source area in pixels |
-| `dilation_radius` | `0.07"` | Segmap dilation for grouping — controls which sources are co-fitted |
-| `fit_dilation_radius` | `0.24"` | Fitting footprint expansion — larger region gives Tractor profile-wing data, reducing flux overestimation for extended sources |
-| `group_buffer` | `2.0"` | Extra padding around each group cutout |
-| `group_size_limit` | `10` | Groups larger than this are skipped |
-| `neighbor_subtraction` | `True` | Second forced-phot pass: subtract neighboring group models before fitting; needed when `fit_dilation_radius` is large |
-| `neighbor_radius` | `5.0"` | Radius within which neighbors are subtracted |
-| `renorm_psf` | `1.0` | Normalise PSF stamp to this sum; `1.0` = unbiased |
-| `ncpus` | `0` | Worker processes; `0` = serial |
+| `thresh` | `3.0` | SEP detection threshold (× background RMS) |
+| `minarea` | `5` | Minimum source area in pixels |
+| `dilation_radius` | `0.2"` | Segmap dilation for grouping |
+| `fit_dilation_radius` | `0.2"` | Fitting footprint expansion (captures profile wings) |
+| `group_buffer` | `0.01"` | Extra padding around each group cutout |
+| `group_size_limit` | `10` | Skip groups larger than this |
+| `neighbor_subtraction` | `False` | Two-pass mode that subtracts neighbor models |
+| `neighbor_radius` | `5.0"` | Radius for neighbor subtraction |
+| `noshot` | `False` | If True, use background-only weights for kappa |
+| `ncpus` | `0` | Worker processes (`0` = serial) |
+| `paddingpixel` | `34` | Boundary padding for flagging edge sources |
+| `save_model_image` | `True` | Write `<output>_model.fits` and `<output>_residual.fits` |
+
+See [`docs/research_note.md`](docs/research_note.md) for the rationale behind decoupling `dilation_radius` and `fit_dilation_radius`.
 
 ---
 
-## Output catalog columns
+## Output catalog
 
+### Position and shape
 | Column | Description |
 |---|---|
 | `id` | Detection ID (1-indexed) |
-| `ra`, `dec` | Sky position (deg) |
+| `ra`, `dec`, `ra_err`, `dec_err` | Sky position and uncertainty (deg) |
 | `x`, `y` | Pixel position |
 | `a`, `b`, `theta` | SEP shape moments |
-| `flag` | Bitwise OR of detection flags (see table below) |
 | `group_id`, `group_pop` | Group assignment and size |
-| `{band}_flux` | Fitted flux (image DN) |
-| `{band}_flux_err` | Marginalized Fisher flux uncertainty including shot noise (recommended; see below) |
-| `{band}_flux_err_noshot` | Marginalized Fisher flux uncertainty, background noise only (shot noise excluded) |
-| `{band}_flux_err_des` | DES-style residual-based flux uncertainty |
-| `{band}_flux_err_tractor_origin` | Raw Tractor diagonal Fisher error (fixed-template, not marginalized) |
-| `{band}_mag` | AB magnitude |
+| `flag` | Bitwise OR of detection flags (see below) |
 | `name` | Model type: `PointSource`, `SimpleGalaxy`, `ExpGalaxy`, `DevGalaxy`, `FixedCompositeGalaxy` |
-| `logre`, `logre_err` | Log half-light radius (log arcsec) and its uncertainty from model selection (ExpGalaxy / DevGalaxy) |
-| `logre_exp`, `logre_exp_err` | Exp component log half-light radius and uncertainty (FixedCompositeGalaxy) |
-| `logre_dev`, `logre_dev_err` | Dev component log half-light radius and uncertainty (FixedCompositeGalaxy) |
-| `ee1_err`, `ee2_err` | Ellipticity component uncertainties from model selection |
+| `logre`, `logre_err` | Log half-light radius and uncertainty (single-component galaxies) |
+| `logre_exp`, `logre_dev` | Component sizes (composite galaxies) |
 | `total_rchisq` | Reduced chi² of forced photometry |
 
+### Flux columns (per band)
+| Column | Description |
+|---|---|
+| `{band}_flux` | Fitted flux (image DN) |
+| `{band}_flux_err` | **Recommended.** Marginalized Fisher error including shot noise + size propagation + kappa |
+| `{band}_flux_err_noshot` | Same, background noise only |
+| `{band}_flux_err_des` | DES residual-based error × marginalization ratio + size propagation + kappa |
+| `{band}_flux_err_kappa` | Correlated-noise inflation factor applied to all error columns |
+| `{band}_flux_err_tractor_origin` | Raw fixed-template Fisher error (for diagnostics) |
+
+See [`docs/research_note.md`](docs/research_note.md) for derivations and MC validation.
+
 ### Detection flags
-
-The `flag` column is a bitwise OR of the following values:
-
-| Bit | Value | Description |
+| Bit | Value | Source |
 |---|---|---|
-| 0 | 1 | Object has neighbors (SEP) |
-| 1 | 2 | Object was blended with another (SEP) |
-| 2 | 4 | At least one pixel saturated or exceeds a threshold (SEP) |
-| 3 | 8 | Object is truncated at the image boundary (SEP) |
-| 4 | 16 | Object's aperture data are incomplete or corrupted (SEP) |
-| 5 | 32 | Object's isophotal data are incomplete or corrupted (SEP) |
+| 0 | 1 | Has neighbors (SEP) |
+| 1 | 2 | Was blended (SEP) |
+| 2 | 4 | Saturated pixel (SEP) |
+| 3 | 8 | Truncated at boundary (SEP) |
+| 4 | 16 | Aperture data corrupted (SEP) |
+| 5 | 32 | Isophotal data corrupted (SEP) |
 | 6 | 64 | Memory overflow during deblending (SEP) |
 | 7 | 128 | Memory overflow during extraction (SEP) |
-| 8 | 256 (`0x0100`) | Object center is within `paddingpixel` pixels of the image boundary (slimfarmer) |
-
-Bits 0–7 are set by SEP during source extraction. Bit 8 is set by slimfarmer to flag detections whose centroid falls within `config.paddingpixel` (default 34) pixels of any image edge. To check for boundary sources: `catalog['flag'] & 0x0100 != 0`.
-
-### Flux error columns
-
-slimfarmer provides three flux error estimates:
-
-| Column | Formula | What it captures |
-|---|---|---|
-| `flux_err` | Marginalized Fisher (bg + shot noise) + size propagation | Full noise budget, marginalized over fitted parameters, plus size uncertainty from model selection (recommended) |
-| `flux_err_noshot` | Marginalized Fisher (bg noise only) + size propagation | Background-only noise, marginalized over fitted parameters, plus size uncertainty |
-| `flux_err_des` | DES residual-based × marginalization ratio + size propagation | Catches model mismatch, parameter marginalization, and size uncertainty |
-
-#### How the marginalized Fisher error works
-
-slimfarmer uses two-pass photometry: model selection fits the galaxy size, shape, and position, then forced photometry freezes morphology and refits only flux. A naive Fisher error (the Cramer-Rao bound for a **fixed** template) underestimates the true scatter because it ignores the fact that the template was inferred from the same noisy data.
-
-When non-flux parameters (position, ellipticity, size) are jointly fitted, the best-fit template correlates with the noise realization. Each noise draw nudges the fitted position and shape slightly, and the template rendered at those shifted parameters partially "follows" the noise, inflating the flux scatter beyond the fixed-template prediction. MC tests show this effect inflates sigma_MC by ~30% for a typical ExpGalaxy (mag=21, HLR=0.8", Roman H158).
-
-To account for this, the error computation has two components:
-
-**Component 1: Marginalized Fisher error** — builds the **full Fisher information matrix** over all thawed source parameters (flux, position, shape) during forced photometry, adds Gaussian prior contributions, inverts, and extracts the marginalized flux variance:
-
-```
-F_ij = Σ_pix [ invvar_pix × (∂model/∂θ_i) × (∂model/∂θ_j) ]  +  prior Hessian
-Cov  = F⁻¹
-flux_err_marg = sqrt(Cov[flux, flux])
-```
-
-Model derivatives are computed by central finite differences using Tractor's step sizes. The two variants differ only in the weight map:
-
-| Variant | Weight map |
-|---|---|
-| `flux_err_shot_raw` | `1 / (σ²_bg + model_flux / eff_gain)` — includes source Poisson shot noise |
-| `flux_err_noshot_raw` | `1 / σ²_bg` — background variance only |
-
-**Component 2: Size propagation** — forced photometry freezes morphology (size, shape), so the Fisher matrix above cannot capture size uncertainty from model selection. For ExpGalaxy/DevGalaxy sources, the size propagation term estimates `dF/d(logre)` numerically and combines it with `logre_err` from model selection:
-
-```
-sigma_prop = |dF/d(logre)| × logre_err
-```
-
-**Final error**: the two components are added in quadrature:
-
-```
-flux_err       = sqrt(flux_err_shot_raw²   + sigma_prop²)
-flux_err_noshot = sqrt(flux_err_noshot_raw² + sigma_prop²)
-```
-
-`flux_err_noshot` isolates the background noise contribution and is useful for comparing predicted vs observed scatter in simulations where shot noise can be toggled off.
-
-#### How `flux_err_des` incorporates the marginalization correction
-
-The raw DES error is `flux_err_fixed * sqrt(χ²/dof)` — it scales the fixed-template Fisher bound by the local reduced chi-squared. The `sqrt(χ²/dof)` factor catches **model misfit** (wrong PSF, neighbor contamination) because these raise χ²/dof above 1.
-
-However, the noise-correlated template effect actually makes the model fit the data **too well**: the template partially overfits the noise, so χ²/dof stays near 1. The raw DES error is blind to this.
-
-To fix this, slimfarmer replaces the fixed-template baseline with the marginalized Fisher and adds the size propagation term:
-
-```
-marg_ratio   = flux_err_shot_raw / flux_err_shot_fixed
-flux_err_des = sqrt((flux_err_des_raw × marg_ratio)² + sigma_prop²)
-```
-
-where `flux_err_shot_fixed` is the fixed-template (diagonal-only) Fisher error with shot noise, and `sigma_prop` is the same size propagation term described above.
-
-This preserves the DES chi2/dof scaling while raising the floor from the fixed-template bound to the correct marginalized bound. When the model fits well (χ²/dof ≈ 1), `flux_err_des ≈ flux_err` (the marginalized Fisher). When the model fits poorly (χ²/dof > 1), the error inflates further on top of the marginalization correction.
-
-#### Empirical validation
-
-See [`doc/Flux_error_validation_colab.ipynb`](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) for a runnable validation notebook covering both white and correlated noise scenarios.
-
-Single ExpGalaxy, mag=21, HLR=0.8", Roman H158, EXPTIME=642s, read-noise=10e, N=200 MC realizations, `noshot=True`:
-
-| Error estimate | Mean value | sigma_MC / mean |
-|---|---|---|
-| Fixed-template Fisher (old `flux_err`) | 0.78 e/s | 1.32 |
-| **Marginalized Fisher (`flux_err_noshot`)** | **0.94 e/s** | **1.10** |
-| MC ground truth (`std` over realizations) | 1.03 e/s | 1.00 |
-
-The marginalized Fisher closes ~80% of the gap between the fixed-template bound and the MC truth. The residual ~10% is expected higher-order estimator inefficiency beyond the Cramer-Rao bound (the CR bound is a lower bound on variance for any unbiased estimator; the actual joint position+flux+shape estimator has some nonlinear inefficiency that the Fisher matrix cannot capture).
-
-For science use, `flux_err` (with shot noise) is the recommended single-object error. For calibrating the full error budget, MC simulations remain the ground truth.
+| 8 | 256 (`0x0100`) | Within `paddingpixel` of image edge (slimfarmer) |
 
 ---
 
-## Diagnosing individual sources
+## Truth matching
 
-### Track model selection stages
+```python
+from slimfarmer.utils import match_spatial, match_spatial_mag
+
+# Pure spatial matching (S)
+idx, sep = match_spatial(cat['ra'], cat['dec'],
+                         truth['ra'], truth['dec'])
+
+# Spatial + magnitude matching (S+M), single band
+idx, sep, dmag = match_spatial_mag(
+    cat['ra'], cat['dec'], cat['mag_F158'],
+    truth['ra'], truth['dec'], truth['mag_F158'],
+    radius_arcsec=0.6, mag_thresh=1.0,
+)
+
+# Spatial + multi-band magnitude matching
+idx, sep, dmag = match_spatial_mag(
+    cat['ra'], cat['dec'],
+    np.column_stack([cat['mag_Y'], cat['mag_J'], cat['mag_H']]),
+    truth['ra'], truth['dec'],
+    np.column_stack([truth['mag_Y'], truth['mag_J'], truth['mag_H']]),
+    radius_arcsec=0.6, mag_thresh=1.0,
+)
+```
+
+The S+M metric is `sqrt(Σ Δmag_i²)`. Unmatched sources get `idx = -1`.
+
+---
+
+## Reading Roman IMCOM CPR files
+
+```python
+sci, wht, psf, eff_gain, noise_reals = slimfarmer.prepare_images_from_cpr(
+    cpr_path='im3x2-H1_00_00.cpr.fits.gz',
+    work_dir='output/',
+)
+```
+
+Requires `pyimcom`.
+
+---
+
+## Diagnostics
+
+### Track a single source through model selection
 
 ```python
 from slimfarmer.track import track_source
 
 result = track_source(
-    source_id       = 151,
-    science_path    = 'roman_image.fits',
-    weight_path     = 'roman_weight.fits',
-    psf_path        = 'PSF_F158.fits',
-    band            = 'F158',
-    zeropoint       = 26.511,
-    truth_pos_path  = 'galaxy_positions.parquet',   # optional
-    truth_flux_path = 'galaxy_fluxes.parquet',      # optional
-    truth_flux_col  = 'roman_flux_H158',            # optional
-    plot            = True,
-    plot_out        = 'source_151.png',
+    source_id=151,
+    science_path='roman_image.fits',
+    weight_path ='roman_weight.fits',
+    psf_path    ='PSF_F158.fits',
+    band        ='F158',
+    zeropoint   =26.511,
+    plot=True, plot_out='source_151.png',
 )
-# result keys: stages, final_model, obs_flux_nm, true_flux_nm, flux_ratio
 ```
 
-### Full photometry diagnostic (notebook)
+### Full diagnostic plot
 
 ```python
-import slimfarmer
-from slimfarmer.track import _get_flux_converters
-from astropy.io import fits
-import pandas as pd
-
-DATA = '/path/to/data'
-
-obs_to_nm, truth_to_nm = _get_flux_converters(DATA+'/roman_image.fits', 'F158')
-with fits.open(DATA+'/roman_image.fits') as h:
-    oversamplepix = abs(h[0].header['CDELT2']) * 3600.
-
-cfg = slimfarmer.Config()
-img = slimfarmer.FarmerImage(
-    bands={'F158': {
-        'science':   DATA+'/roman_image.fits',
-        'weight':    DATA+'/roman_weight.fits',
-        'psf':       DATA+'/PSF_F158.fits',
-        'zeropoint': 26.511,
-    }},
-    detection_band='F158', config=cfg,
-)
-img.detect()
-
-truth = pd.read_parquet(DATA+'/galaxy_fluxes.parquet').merge(
-        pd.read_parquet(DATA+'/galaxy_positions.parquet'), on='galaxy_id')
-
 result = slimfarmer.diagnose_source(
     151, img, truth, obs_to_nm, truth_to_nm, oversamplepix)
-result['fig'].savefig('diag_151.png', dpi=150, bbox_inches='tight')
+result['fig'].savefig('diag_151.png', dpi=150)
 ```
 
-The diagnostic plot shows five panels: science image, weight map, model image, chi residuals, and radial profile (data vs model).
-
----
-
-## Testing
-
-Run the bias test against the Roman H158 simulation:
-
-```bash
-cd /path/to/Roman_photometry
-python test_slimfarmer.py
-```
-
-**Success criterion**: `0.97 ≤ median(obs_flux / true_flux) ≤ 1.03`
-
-The test runs the full pipeline on `slimfarmer_outputroman_image.fits`, cross-matches to the truth catalog, and reports the median flux ratio and scatter.
+Shows science image, weight map, model, chi residuals, and radial profile.
 
 ---
 
@@ -344,22 +224,22 @@ The test runs the full pipeline on `slimfarmer_outputroman_image.fits`, cross-ma
 
 | Notebook | Description |
 |---|---|
-| `doc/tutorial.ipynb` | Full walkthrough: CPR → images → photometry → diagnostics |
-| `doc/demo.ipynb` | Quick demo using pre-prepared FITS files |
-| `doc/Flux_error_validation_colab.ipynb` | Flux error validation: white vs correlated noise MC tests [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) |
+| `docs/tutorial.ipynb` | End-to-end walkthrough: CPR → images → photometry → diagnostics |
+| `docs/demo.ipynb` | Quick demo with pre-prepared FITS files |
+| `docs/Flux_error_validation_colab.ipynb` | Flux error MC validation [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) |
+
+---
+
+## Testing
 
 ```bash
-jupyter notebook slimfarmer/doc/tutorial.ipynb
+python test_slimfarmer.py
 ```
 
-## Reading Roman IMCOM CPR files
+**Success criterion:** `0.97 ≤ median(obs_flux / true_flux) ≤ 1.03`
 
-```python
-sci_path, wht_path, psf_path = slimfarmer.prepare_images_from_cpr(
-    cpr_path = 'im3x2-H0_00_00.cpr.fits.gz',
-    work_dir = 'output/',
-    # psf_fwhm_arcsec = 0.240,  # override default Roman H158 PSF FWHM
-)
-```
+---
 
-Requires `pyimcom` for reading the CPR format.
+## Documentation
+
+- **[`docs/research_note.md`](docs/research_note.md)** — algorithmic details: decoupled grouping/fitting regions, marginalized Fisher errors, kappa correction derivation, and MC validation results.

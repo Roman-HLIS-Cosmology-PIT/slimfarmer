@@ -1,6 +1,6 @@
 # slimfarmer
 
-A streamlined multi-band photometry pipeline that uses **SEP** for source detection and **Tractor** for PSF/galaxy model fitting, with correlated-noise corrections derived from noise realizations. Designed for Roman IMCOM coadds and inspired by [The Farmer](https://github.com/astroweaver/the_farmer) (Weaver et al. 2023).
+A streamlined multi-band photometry pipeline that uses **SEP** for source detection and **Tractor** for galaxy model fitting, with correlated-noise corrections derived from noise realizations. Designed for Roman IMCOM coadds and inspired by [The Farmer](https://github.com/astroweaver/the_farmer) (Weaver et al. 2023).
 
 For algorithmic details, derivations, and validation results, see [`docs/research_note.md`](docs/research_note.md).
 
@@ -10,8 +10,8 @@ For algorithmic details, derivations, and validation results, see [`docs/researc
 
 1. **Detection** — single SEP pass produces a source catalog and segmentation map (no iterative re-detection).
 2. **Grouping** — overlapping segmaps (after dilation) are co-fitted as a group to handle blends.
-3. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model.
-4. **Forced photometry** — morphology is frozen and only flux is refit; optional second pass subtracts neighbor models.
+3. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model. Note that FixedCompositeGalaxy is similar to `Cmodel`, except that the FixedCompositeGalaxy varies both the exponential profile and the dev profile at the same time, while `Cmodel` fits the exponential profile and the dev profile separately.  
+4. **Forced photometry** — morphology is frozen, and only flux is refit; an optional second pass subtracts neighbor models (although this is not the default).
 5. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations.
 
 ---

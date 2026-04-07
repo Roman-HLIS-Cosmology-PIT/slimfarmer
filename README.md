@@ -236,7 +236,7 @@ Shows science image, weight map, model, chi residuals, and radial profile.
 python test_slimfarmer.py
 ```
 
-**Success criterion:** `0.97 ≤ median(obs_flux / true_flux) ≤ 1.03`
+**Success criterion:** TBD
 
 ---
 

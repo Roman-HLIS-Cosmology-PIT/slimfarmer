@@ -442,8 +442,9 @@ class FarmerImage:
             groups = [self._spawn_group(gid) for gid in group_ids]
             pool = mp.Pool(processes=self.config.ncpus, maxtasksperchild=20)
             async_results = [pool.apply_async(_process_group, (g,)) for g in groups]
+            del groups
             pool.close()
-            pbar = _tqdm.tqdm(total=len(groups), desc='Groups')
+            pbar = _tqdm.tqdm(total=len(async_results), desc='Groups')
             for ar in async_results:
                 try:
                     result = ar.get(timeout=self.config.timeout)
@@ -489,6 +490,7 @@ class FarmerImage:
                             pool.imap(_process_group_second_pass, args_list),
                             total=len(args_list), desc='Neighbors'):
                         self._absorb(result)
+                del args_list
             self.logger.info(f'Neighbor pass done — {len(self.model_catalog)} sources.')
 
     # ── Post-fit correlated-noise kappa ─────────────────────────────────────
@@ -512,7 +514,7 @@ class FarmerImage:
             # noise_corr from init already uses sigma estimated from
             # the realizations themselves, so no re-estimation needed.
 
-            for source_id, model in self.model_catalog.items():
+            for source_id, model in _tqdm.tqdm(self.model_catalog.items()):
                 if not hasattr(model, 'flux_err_noisereal_kappa'):
                     model.flux_err_noisereal_kappa = {}
 
@@ -526,10 +528,11 @@ class FarmerImage:
                 nzx = cache['nzx'].astype(np.intp)
                 D = cache['D']
 
-                dy = nzy[:, None] - nzy[None, :]
-                dx = nzx[:, None] - nzx[None, :]
-                r_vals = noise_corr[dy % ny, dx % nx]
-                hTRh = float(np.sum(h_vals[:, None] * r_vals * h_vals[None, :]))
+                hTRh = 0.0
+                for i in range(len(h_vals)):
+                    dy_i = (nzy[i] - nzy) % ny
+                    dx_i = (nzx[i] - nzx) % nx
+                    hTRh += h_vals[i] * np.dot(h_vals, noise_corr[dy_i, dx_i])
 
                 kappa_sq = hTRh / D
                 model.flux_err_noisereal_kappa[band] = np.sqrt(max(kappa_sq, 1.0))
@@ -692,6 +695,12 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
     img = FarmerImage(bands, detection_band=detection_band, config=config)
     img.detect()
     img.process_groups(group_ids=group_ids)
+    import gc, ctypes
+    gc.collect()
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
     logger = logging.getLogger('slimfarmer')
     logger.info('All groups done. Computing kappa...')
     img.compute_kappa()

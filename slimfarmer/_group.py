@@ -648,26 +648,14 @@ class _Group:
                     model.flux_err_des[band] = 0.0
                     continue
 
-                src_copy = copy.deepcopy(model)
-                temp_engine = Tractor([img], [src_copy])
-                temp_engine.bands = [band]
-                model_img = temp_engine.getModelImage(0)
-
-                model_peak = float(np.max(model_img))
-                if model_peak <= 0:
-                    model.flux_err_des[band] = 0.0
-                    continue
-                footprint = model_img > 1e-2 * model_peak
-
-                invvar_foot = invvar[footprint]
-                valid = invvar_foot > 0
+                valid = invvar > 0
                 if not np.any(valid):
                     model.flux_err_des[band] = 0.0
                     continue
 
-                # chi2 on footprint
-                fdiff = (img.data[footprint][valid] - model_total[footprint][valid]) \
-                        * np.sqrt(invvar_foot[valid])
+                # chi2 on all valid pixels
+                fdiff = (img.data[valid] - model_total[valid]) \
+                        * np.sqrt(invvar[valid])
                 chi2 = float(np.sum(fdiff ** 2))
 
                 # dof = n_pixels - n_params (ngmix convention)
@@ -1046,9 +1034,6 @@ class _Group:
         self._compute_flux_err_shot()
         self._cache_kappa_data()
         return True
-
-
-# ── Module-level helpers (must be at top level for multiprocessing pickle) ─────
 
 def _process_group(group):
     """Determine models + force photometry for a group; return serialisable result."""

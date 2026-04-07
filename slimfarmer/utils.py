@@ -518,3 +518,91 @@ def meanall_new(imageall, wall, effiall, bandall=['Y106', 'J129', 'H158']):
     effi_equivalent = n * sci / effi_num 
 
     return sci, wall, effi_equivalent   
+
+
+def match_spatial(cat_ra, cat_dec, truth_ra, truth_dec):
+    """Pure spatial matching (S): closest truth object per detected source.
+
+    Parameters
+    ----------
+    cat_ra, cat_dec : array — detected source coordinates (degrees).
+    truth_ra, truth_dec : array — truth catalogue coordinates (degrees).
+
+    Returns
+    -------
+    idx : int array, shape (N_cat,) — index into truth catalogue for each
+        detected source (nearest neighbour).
+    sep : float array, shape (N_cat,) — on-sky separation in arcsec.
+    """
+    from astropy.coordinates import SkyCoord
+    cat_coord = SkyCoord(cat_ra, cat_dec, unit='deg')
+    truth_coord = SkyCoord(truth_ra, truth_dec, unit='deg')
+    idx, d2d, _ = cat_coord.match_to_catalog_sky(truth_coord)
+    return idx, d2d.to(u.arcsec).value
+
+
+def match_spatial_mag(cat_ra, cat_dec, cat_mags,
+                      truth_ra, truth_dec, truth_mags,
+                      radius_arcsec=0.6, mag_thresh=1.0):
+    """Spatial + magnitude matching (S+M), supporting multiple bands.
+
+    For each detected source, find truth objects within *radius_arcsec*.
+    Among those, select the one with the smallest multi-band magnitude
+    distance sqrt(dmag1² + dmag2² + ...), provided that distance is less
+    than *mag_thresh*.  Sources with no qualifying neighbour are marked
+    unmatched (index = -1).
+
+    Parameters
+    ----------
+    cat_ra, cat_dec : arrays — detected catalogue coordinates (degrees).
+    cat_mags : array, shape (N_cat,) or (N_cat, N_bands) — detected magnitudes.
+    truth_ra, truth_dec : arrays — truth catalogue coordinates (degrees).
+    truth_mags : array, shape (N_truth,) or (N_truth, N_bands) — truth magnitudes.
+    radius_arcsec : float — spatial search radius (default 0.6", ~3 Roman px).
+    mag_thresh : float — maximum allowed magnitude distance (default 1.0).
+
+    Returns
+    -------
+    idx : int array, shape (N_cat,) — index into truth catalogue, or -1 if
+        unmatched.
+    sep : float array, shape (N_cat,) — separation in arcsec (-1 if unmatched).
+    dmag : float array, shape (N_cat,) — magnitude distance (NaN if unmatched).
+    """
+    from astropy.coordinates import SkyCoord
+
+    cat_coord = SkyCoord(cat_ra, cat_dec, unit='deg')
+    truth_coord = SkyCoord(truth_ra, truth_dec, unit='deg')
+
+    cat_mags = np.atleast_2d(np.asarray(cat_mags, dtype=np.float64))
+    truth_mags = np.atleast_2d(np.asarray(truth_mags, dtype=np.float64))
+    if cat_mags.shape[0] != len(cat_coord):
+        cat_mags = cat_mags.T
+    if truth_mags.shape[0] != len(truth_coord):
+        truth_mags = truth_mags.T
+
+    idx_out = np.full(len(cat_coord), -1, dtype=int)
+    sep_out = np.full(len(cat_coord), -1.0)
+    dmag_out = np.full(len(cat_coord), np.nan)
+
+    idxc, idxt, d2d, _ = truth_coord.search_around_sky(
+        cat_coord, radius_arcsec * u.arcsec)
+
+    sep_vals = d2d.to(u.arcsec).value
+
+    for i in range(len(cat_coord)):
+        mask = idxc == i
+        if not np.any(mask):
+            continue
+        t_idx = idxt[mask]
+        t_sep = sep_vals[mask]
+        diff = cat_mags[i] - truth_mags[t_idx]
+        t_dist = np.sqrt(np.sum(diff ** 2, axis=1))
+        valid = t_dist < mag_thresh
+        if not np.any(valid):
+            continue
+        best = np.argmin(t_dist[valid])
+        idx_out[i] = t_idx[valid][best]
+        sep_out[i] = t_sep[valid][best]
+        dmag_out[i] = t_dist[valid][best]
+
+    return idx_out, sep_out, dmag_out

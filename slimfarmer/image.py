@@ -528,11 +528,12 @@ class FarmerImage:
                 nzx = cache['nzx'].astype(np.intp)
                 D = cache['D']
 
-                hTRh = 0.0
-                for i in range(len(h_vals)):
-                    dy_i = (nzy[i] - nzy) % ny
-                    dx_i = (nzx[i] - nzx) % nx
-                    hTRh += h_vals[i] * np.dot(h_vals, noise_corr[dy_i, dx_i])
+                H = np.zeros((ny, nx), dtype=np.float64)
+                np.add.at(H, (nzy % ny, nzx % nx), h_vals)
+                Rk = np.fft.rfft2(noise_corr)
+                Hk = np.fft.rfft2(H)
+                conv = np.fft.irfft2(Rk * Hk, s=(ny, nx))
+                hTRh = float(np.sum(H * conv))
 
                 kappa_sq = hTRh / D
                 model.flux_err_noisereal_kappa[band] = np.sqrt(max(kappa_sq, 1.0))

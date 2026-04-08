@@ -4,6 +4,12 @@ A streamlined multi-band photometry pipeline that uses **SEP** for source detect
 
 For algorithmic details, derivations, and validation results, see [`docs/research_note.md`](docs/research_note.md).
 
+
+#### Working note:
+- We might want to consider Sersic fit according to https://www.legacysurvey.org/dr9/catalogs/. Need to check LSST-DM's compatibility.
+  
+
+
 ---
 
 ## Pipeline overview

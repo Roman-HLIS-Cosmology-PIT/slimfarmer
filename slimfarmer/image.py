@@ -203,6 +203,7 @@ class FarmerImage:
             convfilt = get_detection_kernel(cfg.filter_kernel)
 
         sep.set_extract_pixstack(cfg.pixstack_size)
+        sep.set_sub_object_limit(2048)
         catalog, segmap = sep.extract(
             img, cfg.thresh, var=var, minarea=cfg.minarea,
             filter_kernel=convfilt, filter_type=cfg.filter_type,
@@ -245,6 +246,57 @@ class FarmerImage:
         self.groupmap_dict = segmap_to_dict(groupmap)
         self.logger.info(f'Found {int(groupmap.max())} groups.')
         return catalog
+
+    # ── Stitching helper ──────────────────────────────────────────────────────
+
+    def drop_isolated_groups_outside_pixbox(self, central_pixbox):
+        """Drop sources whose group has no member touching `central_pixbox`.
+
+        A source is considered "touching" the central box iff its SEP
+        bounding box ``[xmin..xmax] x [ymin..ymax]`` intersects the
+        ``(x0, y0, x1, y1)`` half-open rectangle ``central_pixbox``.
+
+        Sources whose centroid is outside the central box but whose segmap
+        bbox extends into it are *kept* (their flux still affects the fit
+        of central-block neighbors). Pure-buffer-ring groups — i.e. groups
+        where no member's bbox intersects the central box — are dropped
+        entirely so they're not modeled.
+
+        This must be called after :meth:`detect` and before
+        :meth:`process_groups`.
+        """
+        if self.catalog is None:
+            raise RuntimeError('Call detect() before drop_isolated_groups_outside_pixbox().')
+        x0, y0, x1, y1 = central_pixbox
+        cat = self.catalog
+        if not all(c in cat.colnames for c in ('xmin', 'xmax', 'ymin', 'ymax')):
+            raise RuntimeError('Catalog is missing SEP bbox columns; cannot filter.')
+        bb_x0 = np.asarray(cat['xmin'])
+        bb_x1 = np.asarray(cat['xmax']) + 1
+        bb_y0 = np.asarray(cat['ymin'])
+        bb_y1 = np.asarray(cat['ymax']) + 1
+        touches_central = (bb_x1 > x0) & (bb_x0 < x1) & (bb_y1 > y0) & (bb_y0 < y1)
+
+        gids = np.asarray(cat['group_id'])
+        central_gids = set(int(g) for g in np.unique(gids[touches_central]))
+        keep_mask = np.array([int(g) in central_gids for g in gids])
+
+        n_before = len(cat)
+        kept_ids  = set(int(i) for i in np.asarray(cat['id'])[keep_mask])
+        self.catalog = cat[keep_mask]
+
+        if self.segmap_dict is not None:
+            self.segmap_dict = {k: v for k, v in self.segmap_dict.items()
+                                if int(k) in kept_ids}
+        if self.groupmap_dict is not None:
+            self.groupmap_dict = {k: v for k, v in self.groupmap_dict.items()
+                                  if int(k) in central_gids}
+
+        self.logger.info(
+            f'Stitching filter: kept {len(self.catalog)}/{n_before} sources '
+            f'({len(central_gids)} groups touch central box {central_pixbox}); '
+            f'dropped {n_before - len(self.catalog)} isolated buffer-ring detections.'
+        )
 
     # ── Group spawning ────────────────────────────────────────────────────────
 
@@ -513,6 +565,8 @@ class FarmerImage:
 
             # noise_corr from init already uses sigma estimated from
             # the realizations themselves, so no re-estimation needed.
+            # Rk depends only on the band, not on the source — hoist it.
+            Rk = np.fft.rfft2(noise_corr)
 
             for source_id, model in _tqdm.tqdm(self.model_catalog.items()):
                 if not hasattr(model, 'flux_err_noisereal_kappa'):
@@ -530,7 +584,6 @@ class FarmerImage:
 
                 H = np.zeros((ny, nx), dtype=np.float64)
                 np.add.at(H, (nzy % ny, nzx % nx), h_vals)
-                Rk = np.fft.rfft2(noise_corr)
                 Hk = np.fft.rfft2(H)
                 conv = np.fft.irfft2(Rk * Hk, s=(ny, nx))
                 hTRh = float(np.sum(H * conv))
@@ -538,7 +591,7 @@ class FarmerImage:
                 kappa_sq = hTRh / D
                 model.flux_err_noisereal_kappa[band] = np.sqrt(max(kappa_sq, 1.0))
 
-            del noise_corr; gc.collect()
+            del noise_corr, Rk; gc.collect()
 
     # ── Build catalog ─────────────────────────────────────────────────────────
 
@@ -650,6 +703,7 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
                    weight_path=None, eff_gain_path=None, noise_reals_path=None,
                    bands=None,
                    detection_band=None, output_path=None, group_ids=None,
+                   central_pixbox=None,
                    config=None, **config_kwargs):
     """
     One-call photometry pipeline.  Supports both single-band and multi-band modes.
@@ -695,6 +749,8 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
 
     img = FarmerImage(bands, detection_band=detection_band, config=config)
     img.detect()
+    if central_pixbox is not None:
+        img.drop_isolated_groups_outside_pixbox(central_pixbox)
     img.process_groups(group_ids=group_ids)
     import gc, ctypes
     gc.collect()

@@ -17,7 +17,7 @@ class Config:
     deblend_cont = 0.001
     clean = True
     clean_param = 1.0
-    pixstack_size = 1_000_000
+    pixstack_size = 20_000_000
     use_detection_weight = True
     # Grouping
     dilation_radius = 0.2 * u.arcsec
@@ -54,6 +54,13 @@ class Config:
     # Neighbor subtraction (second forced-photometry pass)
     neighbor_subtraction = False     # subtract neighboring group models before forced phot
     neighbor_radius = 5.0 * u.arcsec  # include sources within this radius as neighbors
+
+    # 3x3 stitching (boundary handling for IMCOM blocks)
+    buffer_arcsec = 6.0   # width of neighbor strip to include around the central block
+                          # (0 disables stitching → fall back to per-block processing)
+    block_size_px = 2108
+    # Note: the IMCOM overlap-per-side is `paddingpixel` (defined above).
+    # block_overlap_px is intentionally not a separate field — they must agree.
 
     # Output
     save_model_image = True  # save <output>_model.fits and <output>_residual.fits after run_photometry

@@ -31,11 +31,12 @@ Multi-band usage
 
 from .config import Config
 from .image import FarmerImage, run_photometry
-from .utils import SimpleGalaxy, prepare_images_from_cpr
+from .utils import SimpleGalaxy, prepare_images_from_cpr, prepare_stitched_block
 from .track import track_source, _get_flux_converters
 from .diag import diagnose_source
 
 __version__ = '1.1.0'
 __all__ = ['Config', 'FarmerImage', 'run_photometry', 'SimpleGalaxy',
-           'prepare_images_from_cpr', 'track_source', '_get_flux_converters',
+           'prepare_images_from_cpr', 'prepare_stitched_block',
+           'track_source', '_get_flux_converters',
            'diagnose_source']

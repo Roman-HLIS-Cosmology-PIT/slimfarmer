@@ -34,9 +34,15 @@ from .image import FarmerImage, run_photometry
 from .utils import SimpleGalaxy, prepare_images_from_cpr, prepare_stitched_block
 from .track import track_source, _get_flux_converters
 from .diag import diagnose_source
+from .forced import (forced_photometry, reconstruct_source, load_psf,
+                     find_rubin_coadds_for_tile, find_rubin_coadds,
+                     rubin_coadd_wcs, roman_tile_footprint,
+                     load_skymap_info, source_in_exclusive_region,
+                     patch_inner_bbox_local, nearest_tract)
 
 __version__ = '1.1.0'
 __all__ = ['Config', 'FarmerImage', 'run_photometry', 'SimpleGalaxy',
            'prepare_images_from_cpr', 'prepare_stitched_block',
            'track_source', '_get_flux_converters',
-           'diagnose_source']
+           'diagnose_source',
+           'forced_photometry', 'reconstruct_source', 'load_psf']

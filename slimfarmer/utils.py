@@ -628,14 +628,13 @@ def prepare_stitched_block(cpr_base, work_dir, tile, *,
             else:
                 canvas_arr[:, y0:y1, x0:x1] = src[:, sy0:sy1, sx0:sx1]
 
-        _paste(sci_canvas, sci0, buf_px, buf_px)
-        with fits.open(per_tile_paths[tile][1]) as hd:
-            _paste(wht_canvas, hd[0].data, buf_px, buf_px)
-        with fits.open(per_tile_paths[tile][3]) as hd:
-            _paste(eff_canvas, hd[0].data, buf_px, buf_px)
-        _paste(nr_canvas, nr0, buf_px, buf_px)
-
-        # ── 5. paste each neighbor ───────────────────────────────────────────
+        # ── 5. paste each neighbor FIRST, central LAST ───────────────────────
+        # Order matters: the central block's pixels must win in the central
+        # 2108x2108 region. We accomplish this by pasting all neighbors first
+        # (filling the buffer ring + redundantly the inner overlap region)
+        # and then pasting the central block on top, so the inner region is
+        # exactly the central tile's own data with no contamination from
+        # neighbor IMCOM solutions.
         for d1, d2 in _NEIGHBOR_OFFSETS:
             n_tile = _neighbor_tile_id(tile, d1, d2)
             if n_tile is None or n_tile not in per_tile_paths:
@@ -667,6 +666,16 @@ def prepare_stitched_block(cpr_base, work_dir, tile, *,
                 _paste(nr_canvas, hd[0].data, dx_canvas, dy_canvas)
             if band == bands[0]:
                 neighbors_used.append(n_tile)
+
+        # Central block last — overrides any neighbor pixels in the inner
+        # 2108x2108 so the central region exactly matches the central tile's
+        # own data.
+        _paste(sci_canvas, sci0, buf_px, buf_px)
+        with fits.open(per_tile_paths[tile][1]) as hd:
+            _paste(wht_canvas, hd[0].data, buf_px, buf_px)
+        with fits.open(per_tile_paths[tile][3]) as hd:
+            _paste(eff_canvas, hd[0].data, buf_px, buf_px)
+        _paste(nr_canvas, nr0, buf_px, buf_px)
 
         # ── 6. build stitched WCS by shifting CRPIX ──────────────────────────
         new_header = center_header.copy()

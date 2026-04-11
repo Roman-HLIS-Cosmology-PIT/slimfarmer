@@ -22,7 +22,7 @@ class Config:
     # Grouping
     dilation_radius = 0.2 * u.arcsec
     group_buffer = 0.01 * u.arcsec
-    group_size_limit = 10
+    group_size_limit = 100
     fit_dilation_radius = 0.2 * u.arcsec  # expand fitting region beyond groupmap to capture profile wings
     timeout=1200
     paddingpixel = 34
@@ -61,6 +61,11 @@ class Config:
     block_size_px = 2108
     # Note: the IMCOM overlap-per-side is `paddingpixel` (defined above).
     # block_overlap_px is intentionally not a separate field — they must agree.
+
+    # Canonical IMCOM Roman pixel scale (arcsec/pixel). Used when overlaying
+    # Roman-derived shape parameters (a, b in Roman pixels) on images with
+    # a different pixel scale, e.g. Rubin forced-photometry diagnostics.
+    roman_pixel_scale_arcsec = 0.049019607843138
 
     # Output
     save_model_image = True  # save <output>_model.fits and <output>_residual.fits after run_photometry

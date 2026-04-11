@@ -26,6 +26,22 @@ from .image import FarmerImage
 
 
 # ── Flux unit conversion (IMCOM DN ↔ nanomaggy) ───────────────────────────────
+import galsim
+import os
+def _get_flux_converters_LSST(band, datapath=galsim.meta_data.share_dir):
+    filter_filename = os.path.join(datapath, f'bandpasses/LSST_{band}.dat')
+    bp = galsim.Bandpass(filter_filename, wave_type='nm').withZeropoint("AB")
+
+    def obs_to_nm(flux_in):
+        """LSST DM → nanomaggy."""
+        mag_obs = -2.5*np.log10(flux_in)+27.0
+        return 10 ** ((mag_obs - 22.5) / -2.5)
+    def truth_to_nm(flux_in):
+        """truth → nanomaggy."""
+        mag_AB_true = -2.5 * np.log10(flux_in) + bp.zeropoint
+        return 10 ** ((mag_AB_true - 22.5) / -2.5)
+    return obs_to_nm, truth_to_nm
+
 
 def _get_flux_converters(science_path, band):
     """

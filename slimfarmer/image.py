@@ -122,35 +122,14 @@ class FarmerImage:
             sci[bad] = 0.
             wht[~np.isfinite(wht) | (wht < 0) | bad] = 0.
 
-            # Precompute noise correlation r(dx,dy) once from full image
-            noise_corr = None
-            if noise_reals_path is not None:
-                ny_f, nx_f = sci.shape
-                # Estimate per-pixel sigma directly from the noise realizations.
-                # This avoids unit mismatch between noise layers and weight map.
-                with fits.open(noise_reals_path) as hdul:
-                    nr_all = hdul[0].data.astype(np.float64)
-                sigma_nr = np.std(nr_all, axis=0, ddof=1)
-                # Smooth to reduce noise from few realizations
-                from scipy.ndimage import uniform_filter
-                sigma_nr = uniform_filter(sigma_nr, size=15)
-                sigma_nr = np.where(sigma_nr > 0, sigma_nr, 1.0)
-
-                n_real = nr_all.shape[0]
-                R_2d = np.zeros((ny_f, nx_f), dtype=np.float64)
-                for k in range(n_real):
-                    n_norm = nr_all[k] / sigma_nr
-                    R_2d += np.abs(np.fft.fft2(n_norm)) ** 2
-                    del n_norm
-                R_2d /= n_real
-                noise_corr = np.fft.ifft2(R_2d).real / (ny_f * nx_f)
-                del R_2d, nr_all, sigma_nr
-
+            # noise_corr is built lazily by recompute_noise_corr_with_model()
+            # after the initial fit pass. See doc/compute_kappa_implementation.md
+            # §3 for why the pre-fit empirical-sigma estimate was removed.
             self.band_config[band] = {
                 'science':          sci,
                 'weight':           wht,
                 'eff_gain':         eff_gain,
-                'noise_corr':       noise_corr,
+                'noise_corr':       None,
                 'noise_reals_path': noise_reals_path,
                 'mask':             (wht <= 0) | ~np.isfinite(sci),
                 'psf_model':        psf_model,
@@ -593,6 +572,124 @@ class FarmerImage:
 
             del noise_corr, Rk; gc.collect()
 
+    def recompute_noise_corr_with_model(self, force_r00_to_one=True):
+        """Rebuild ``noise_corr`` per band using fitted models + total variance.
+
+        Background: the pre-fit ``noise_corr`` built in ``__init__`` normalises
+        by the empirical per-pixel σ of the noise-realisation cube (smoothed).
+        That's internally consistent but relies on a 15-px smoothing kernel
+        and doesn't use the weight map or the fitted model at all. See
+        ``doc/compute_kappa_implementation.md`` §3 for the diagnosis of why
+        ``sqrt(w_bg) · n`` alone is non-stationary on IMCOM coadds.
+
+        Post-fit, we can do better: build a total-variance weight that
+        includes source shot noise from the fitted model,
+
+            1/w_total(x) = 1/w_bg(x) + max(model(x), 0) / eff_gain(x)
+
+        then compute ``noise_corr`` as the autocorrelation of
+        ``sqrt(w_total) · n`` averaged over realisations. If the model and
+        ``eff_gain`` are self-consistent with the noise realisation cube,
+        ``n_bar = sqrt(w_total) · n`` has per-pixel variance ≈ 1 and the
+        resulting ``noise_corr`` is a clean correlation coefficient function
+        with ``r(0, 0) ≈ 1``.
+
+        The method logs ``raw_r00`` per band *before* renormalisation. If it
+        is close to 1, the post-fit formulation is self-consistent and the
+        kappa values from the subsequent ``compute_kappa()`` pass are robust.
+        If ``raw_r00`` drifts (say, outside 0.9–1.1), something in the model,
+        ``eff_gain``, or the realisation cube doesn't line up and the result
+        should be treated with suspicion.
+
+        Intended call sequence:
+
+            img.detect()
+            img.process_groups()                   # initial fit pass
+            img.recompute_noise_corr_with_model()  # refine noise_corr
+            img.compute_kappa()                    # use the refined noise_corr
+
+        Parameters
+        ----------
+        force_r00_to_one : bool
+            If True, divide the rebuilt ``noise_corr`` by its central value
+            so that ``r(0, 0) == 1`` exactly. The pre-normalisation value
+            is logged either way.
+        """
+        import gc
+        from astropy.io import fits
+
+        if not self.model_catalog:
+            self.logger.warning(
+                'recompute_noise_corr_with_model: model_catalog is empty; '
+                'call process_groups() first. Skipping.')
+            return
+
+        for band in self.bands:
+            bc = self.band_config[band]
+            noise_reals_path = bc.get('noise_reals_path')
+            if noise_reals_path is None:
+                self.logger.info(f'[{band}] no noise_reals_path — skipping rebuild')
+                continue
+            eff_gain = bc.get('eff_gain')
+            if eff_gain is None:
+                self.logger.info(
+                    f'[{band}] no eff_gain map — cannot add shot noise; '
+                    f'skipping rebuild')
+                continue
+
+            w_bg = bc['weight']
+            bg_var = np.where(w_bg > 0, 1.0 / w_bg, np.inf)
+
+            # Render the current best-fit model on this band's native grid
+            try:
+                model_img = self.build_model_image(band=band)
+            except Exception as e:
+                self.logger.warning(
+                    f'[{band}] build_model_image failed ({e}); skipping rebuild')
+                continue
+
+            eff_g = np.where(eff_gain > 0, eff_gain, np.inf)
+            poisson_var = np.maximum(model_img, 0.0) / eff_g
+            total_var = bg_var + poisson_var
+            w_total = np.where(np.isfinite(total_var) & (total_var > 0),
+                               1.0 / total_var, 0.0)
+            sqrt_w = np.sqrt(w_total)
+
+            with fits.open(noise_reals_path) as hdul:
+                nr_all = hdul[0].data.astype(np.float64)
+            n_real, ny_f, nx_f = nr_all.shape
+
+            # Power spectrum of sqrt(w_total) * n, averaged over realisations
+            R_2d = np.zeros((ny_f, nx_f), dtype=np.float64)
+            for k in range(n_real):
+                n_norm = nr_all[k] * sqrt_w
+                R_2d += np.abs(np.fft.fft2(n_norm)) ** 2
+                del n_norm
+            R_2d /= n_real
+
+            noise_corr = np.fft.ifft2(R_2d).real / (ny_f * nx_f)
+
+            # Diagnostic: how close is r(0, 0) to 1 before we force it?
+            raw_r00 = float(noise_corr[0, 0])
+            if force_r00_to_one:
+                if raw_r00 > 0:
+                    noise_corr = noise_corr / raw_r00
+                else:
+                    self.logger.warning(
+                        f'[{band}] raw r(0,0) = {raw_r00:.4g} ≤ 0; '
+                        f'keeping pre-normalisation noise_corr')
+
+            bc['noise_corr'] = noise_corr
+            msg = (f'[{band}] rebuilt noise_corr from w_total + model  '
+                   f'(raw r00 = {raw_r00:.4f}'
+                   + (', renormalised to 1' if force_r00_to_one else '')
+                   + f', n_real = {n_real})')
+            self.logger.info(msg)
+
+            del nr_all, R_2d, noise_corr, w_bg, bg_var, w_total, sqrt_w
+            del model_img, poisson_var, total_var
+            gc.collect()
+
     # ── Build catalog ─────────────────────────────────────────────────────────
 
     def build_catalog(self):
@@ -759,7 +856,9 @@ def run_photometry(science_path=None, psf_path=None, band=None, zeropoint=None,
     except Exception:
         pass
     logger = logging.getLogger('slimfarmer')
-    logger.info('All groups done. Computing kappa...')
+    logger.info('All groups done. Refining noise_corr with fitted models...')
+    img.recompute_noise_corr_with_model()
+    logger.info('Computing kappa with refined noise_corr...')
     img.compute_kappa()
     logger.info('Kappa done. Building catalog...')
     cat = img.build_catalog()

@@ -534,7 +534,8 @@ def prepare_stitched_block(cpr_base, work_dir, tile, *,
                            buffer_arcsec, block_size_px, block_overlap_px,
                            bands=('Y1', 'J1', 'H1'),
                            truth=False, realization=False, mask=None,
-                           overwrite_per_block=False):
+                           overwrite_per_block=False,
+                           psf_fwhm_arcsec=None):
     """Build per-band stitched images for a 3x3 IMCOM block neighborhood.
 
     For the central tile and each of the 8 neighbors (when present), this
@@ -567,6 +568,13 @@ def prepare_stitched_block(cpr_base, work_dir, tile, *,
     neighbors_used = None
 
     for band in bands:
+        # Resolve per-band PSF FWHM: scalar applies to all bands; dict looks up
+        # by band (missing entries → default).
+        if isinstance(psf_fwhm_arcsec, dict):
+            band_psf_fwhm = psf_fwhm_arcsec.get(band)
+        else:
+            band_psf_fwhm = psf_fwhm_arcsec
+
         # ── 1. ensure central + neighbors are prepared on disk (cached) ──────
         per_tile_paths = {}
         tile_to_load = [tile] + [_neighbor_tile_id(tile, d1, d2)
@@ -579,6 +587,7 @@ def prepare_stitched_block(cpr_base, work_dir, tile, *,
                 cpr_path=cpr_path, work_dir=band_dir,
                 overwrite=overwrite_per_block,
                 truth=truth, realization=realization, mask=mask,
+                psf_fwhm_arcsec=band_psf_fwhm,
             )
             per_tile_paths[t] = (sci_p, wht_p, psf_p, eff_p, nr_p)
 

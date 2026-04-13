@@ -31,7 +31,8 @@ Multi-band usage
 
 from .config import Config
 from .image import FarmerImage, run_photometry
-from .utils import SimpleGalaxy, prepare_images_from_cpr, prepare_stitched_block
+from .utils import (SimpleGalaxy, prepare_images_from_cpr, prepare_stitched_block,
+                    meanall_new, finalize_stitched_catalog, crop_to_central_fits)
 from .track import track_source, _get_flux_converters
 from .diag import diagnose_source
 from .forced import (forced_photometry, reconstruct_source, load_psf,

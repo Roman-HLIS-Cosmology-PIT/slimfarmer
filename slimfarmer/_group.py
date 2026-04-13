@@ -304,14 +304,23 @@ class _Group:
                 total_var = bg_var
             img.setInvvar(np.where(total_var > 0, 1.0 / total_var, 0.))
 
-    def _optimize(self):
-        """Run the Tractor optimiser; returns True on convergence."""
+    def _optimize(self, deadline=None):
+        """Run the Tractor optimiser; returns True on convergence.
+
+        If ``deadline`` (an absolute ``time.time()`` value) is set and the
+        wall-clock exceeds it between optimisation steps, the loop breaks
+        early with whatever progress has been made so far. The caller gets
+        ``True`` (parameters are still valid, just not fully converged).
+        """
         import io, sys
         self.engine.optimizer = TractorOptimizer()
         _saved_stdout, _saved_stderr = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = io.StringIO()
         try:
             for i in range(self.config.max_steps):
+                if deadline is not None and time.time() > deadline:
+                    self.logger.debug('Optimizer hit deadline — returning current state')
+                    break
                 self._update_invvar_with_model()
                 try:
                     dlnp, X, alpha, var = self.engine.optimize(
@@ -558,8 +567,39 @@ class _Group:
 
     # ── Main fitting entry points ──────────────────────────────────────────────
 
-    def determine_models(self):
-        """Run model-type selection on the configured modeling bands (Stages 1–5+)."""
+    def _recover_best_from_tracker(self):
+        """Copy the last-stage model from model_tracker into model_catalog.
+
+        Used when determine_models bails early due to a deadline:
+        _store_models only writes to model_catalog when solved.all() or
+        stage==11, so intermediate stages leave model_catalog empty. This
+        method fills it from whatever the tracker has, so the group always
+        returns usable (if partially-optimised) models.
+        """
+        for sid in self.source_ids:
+            if sid in self.model_catalog and hasattr(self.model_catalog[sid], 'pos'):
+                continue
+            tracker = self.model_tracker.get(sid)
+            if tracker is None:
+                continue
+            stages = sorted(k for k in tracker if isinstance(k, int))
+            for st in reversed(stages):
+                m = tracker[st].get('model')
+                if m is not None and hasattr(m, 'pos'):
+                    self.model_catalog[sid] = m
+                    self.model_catalog[sid].group_id = self.group_id
+                    self.model_catalog[sid].statistics = tracker[st]
+                    break
+
+    def determine_models(self, deadline=None):
+        """Run model-type selection on the configured modeling bands (Stages 1–5+).
+
+        If ``deadline`` (absolute ``time.time()``) is set, the method checks
+        between stages and bails early when time is up. The best model from
+        the last completed stage is recovered into model_catalog, so the
+        caller always gets something usable (just at an earlier model stage,
+        e.g. PointSource instead of ExpGalaxy).
+        """
         self.model_priors_active = self.config.model_priors
         self._reset_models()
         self._add_tracker()
@@ -570,6 +610,12 @@ class _Group:
             return False
         tstart = time.time()
         while not self.solved.all():
+            if deadline is not None and time.time() > deadline:
+                self.logger.debug(
+                    f'determine_models hit deadline at stage {self.stage} '
+                    f'— returning current best')
+                self._recover_best_from_tracker()
+                return True
             self.stage += 1
             self._add_tracker()
             self._stage_models()
@@ -578,13 +624,17 @@ class _Group:
                                    if sid in self.model_catalog])
             self.engine.bands = list(self.images.keys())
             self.engine.freezeParam('images')
-            ok = self._optimize()
+            ok = self._optimize(deadline=deadline)
             if not ok:
                 return False
             self._measure_stats(self.stage)
             self._store_models()
             self._decision_tree()
         # Final convergence pass
+        if deadline is not None and time.time() > deadline:
+            self.logger.debug('determine_models skipping final pass — deadline')
+            self._recover_best_from_tracker()
+            return True
         self.stage += 1
         self._add_tracker()
         self._stage_models()
@@ -593,7 +643,7 @@ class _Group:
                                if sid in self.model_catalog])
         self.engine.bands = list(self.images.keys())
         self.engine.freezeParam('images')
-        ok = self._optimize()
+        ok = self._optimize(deadline=deadline)
         if not ok:
             return False
         self._measure_stats(self.stage)
@@ -991,13 +1041,16 @@ class _Group:
             except Exception as e:
                 self.logger.debug(f'Neighbor subtraction failed for band {band}: {e}')
 
-    def force_models(self, neighboring_models=None):
+    def force_models(self, neighboring_models=None, deadline=None):
         """
         Forced photometry: freeze shape parameters, re-fit flux in all bands.
 
         Detection band is staged first so chi statistics are computed for it.
         If neighboring_models is provided, their PSF-convolved contributions are
         subtracted from the image data before fitting (neighbor subtraction pass).
+
+        If any step fails, model_catalog is restored from the pre-force-models
+        state so that determine_models results are never lost.
         """
         self.model_priors_active = self.config.phot_priors
         self.existing_model_catalog = copy.deepcopy(self.model_catalog)
@@ -1005,11 +1058,18 @@ class _Group:
             return False
         self._reset_models()
         self._add_tracker(init_stage=10)
-        # Stage detection band first, then other bands
         bands_ordered = ([self.detection_band]
                          + [b for b in self.bands if b != self.detection_band])
         self._stage_images(bands=bands_ordered)
         if not self.images:
+            self.model_catalog = self.existing_model_catalog
+            try:
+                self._compute_des_flux_err()
+                self._compute_flux_err_corr()
+                self._compute_flux_err_noshot()
+                self._cache_kappa_data()
+            except Exception:
+                pass
             return False
         if neighboring_models:
             self._subtract_neighbor_contributions(neighboring_models)
@@ -1023,8 +1083,17 @@ class _Group:
         self.engine.bands = list(self.images.keys())
         self.engine.freezeParam('images')
         self._measure_stats(10)
-        ok = self._optimize()
+        ok = self._optimize(deadline=deadline)
         if not ok:
+            self.model_catalog = self.existing_model_catalog
+            # Still compute flux errors from the determine_models engine state
+            try:
+                self._compute_des_flux_err()
+                self._compute_flux_err_corr()
+                self._compute_flux_err_noshot()
+                self._cache_kappa_data()
+            except Exception:
+                pass
             return False
         self._measure_stats(self.stage)
         self._store_models()
@@ -1035,22 +1104,39 @@ class _Group:
         self._cache_kappa_data()
         return True
 
-def _process_group(group):
-    """Determine models + force photometry for a group; return serialisable result."""
+FLAG_TIMEOUT = 0x0200
+
+def _process_group(group, timeout=None):
+    """Determine models + force photometry for a group; return serialisable result.
+
+    If ``timeout`` (seconds) is set, a deadline is computed and passed into
+    ``determine_models`` and ``force_models``. If the deadline is reached
+    mid-optimisation, the group returns its current best result (the last
+    fully-completed model-selection stage) rather than being dropped.
+    Sources in a timed-out group are flagged with ``FLAG_TIMEOUT`` (0x0200).
+    """
     tstart = time.time()
+    deadline = (tstart + timeout) if timeout is not None else None
+    timed_out = False
     if not group.rejected:
         try:
-            ok = group.determine_models()
+            ok = group.determine_models(deadline=deadline)
+            if deadline is not None and time.time() > deadline:
+                timed_out = True
             if ok:
                 group.force_models()
         except Exception:
             pass
+        if deadline is not None and time.time() > deadline:
+            timed_out = True
     elapsed = time.time() - tstart
     for sid in group.source_ids:
         if sid in group.model_tracker:
             stages = [k for k in group.model_tracker[sid] if isinstance(k, int)]
             if stages:
                 group.model_tracker[sid][max(stages)]['group_time'] = elapsed
+                if timed_out:
+                    group.model_tracker[sid][max(stages)]['timed_out'] = True
     return group.group_id, group.model_catalog.copy(), group.model_tracker.copy()
 
 

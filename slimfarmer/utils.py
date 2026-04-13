@@ -443,8 +443,12 @@ def prepare_images_from_cpr(cpr_path, work_dir,
         ra, dec = wcs2d.all_pix2world(xx, yy, 0)   # shape (2108, 2108), degrees
         wht[mask.get_values_pos(ra, dec, lonlat=True, valid_mask=True)]=0
 
-    # Effective gain map: poisson_var = model_flux / eff_gain (in scaled units).
-    eff_gain    = (exptime * Neff / factor).astype(np.float32)
+    # Effective gain map: poisson_var = model_flux / eff_gain.
+    # sci = sci_raw * gain / area_ratio is in e⁻/s/IMCOM_pixel. The gain in
+    # factor cancels with the gain in the electron count, leaving only the
+    # area ratio and exposure depth. See discussion in
+    # doc/compute_kappa_implementation.md.
+    eff_gain    = (exptime * Neff * (pix_size / pix_scale) ** 2).astype(np.float32)
 
     # ── Gaussian PSF stamp ────────────────────────────────────────────────────
     if psf_fwhm_arcsec is None:
@@ -742,27 +746,127 @@ def get_detection_kernel(filter_kernel):
 
 
 import galsim, galsim.roman as groman
-def meanall_new(imageall, wall, effiall, bandall=['Y106', 'J129', 'H158']):
-    oneoverzpall= []
-    for band in bandall:
-        oneoverzpall.append(1.0/(10**(galsim.roman.getBandpasses()[band].zeropoint/2.5)))
-    oneoverzpall = np.array(oneoverzpall)/np.sum(oneoverzpall)
-    scalearray  = oneoverzpall 
-    
-    #scalearray = [0.4849, 0.4777,0.4628]
+def meanall_new(imageall, wall, effiall, noise_reals_all=None,
+                combine_bands=None, band_to_galsim=None):
+    """Inverse-zeropoint-weighted combination of per-band images.
+
+    Parameters
+    ----------
+    imageall, wall, effiall : list of 2-D arrays
+        Science, weight, and effective-gain images (one per band, same order
+        as ``combine_bands``).
+    noise_reals_all : list of 3-D arrays, optional
+        Per-band noise-realisation cubes ``(n_real, ny, nx)``.  If provided,
+        a combined noise-realisation cube is returned as the fourth element.
+    combine_bands : list of str, optional
+        Band names (slimfarmer convention, e.g. ``['Y1', 'J1', 'H1']``).
+        Used to look up galsim zeropoints. Default: ``['Y1', 'J1', 'H1']``.
+    band_to_galsim : dict, optional
+        Maps band names to galsim bandpass names (e.g. ``{'Y1': 'Y106'}``).
+        Default: ``{'Y1':'Y106', 'J1':'J129', 'H1':'H158',
+        'F1':'F184', 'K1':'K213'}``.
+
+    Returns
+    -------
+    sci, wht, eff_gain[, noise_reals] — combined arrays.
+    """
+    import galsim as _gs
+    if combine_bands is None:
+        combine_bands = ['Y1', 'J1', 'H1']
+    if band_to_galsim is None:
+        band_to_galsim = {'Y1': 'Y106', 'J1': 'J129', 'H1': 'H158',
+                          'F1': 'F184', 'K1': 'K213'}
+    bp = _gs.roman.getBandpasses()
+    oneoverzpall = []
+    for band in combine_bands:
+        gs_band = band_to_galsim[band]
+        oneoverzpall.append(1.0 / (10 ** (bp[gs_band].zeropoint / 2.5)))
+    oneoverzpall = np.array(oneoverzpall) / np.sum(oneoverzpall)
+    scalearray = oneoverzpall
+
     n = np.sum(scalearray)
     sumall = 0
     var_num = 0
-    effi_num=0
+    effi_num = 0
     for img, w, eff, s in zip(imageall, wall, effiall, scalearray):
-        sumall += img*s
-        var_num += 1/w*(s**2)
-        effi_num += img / eff*(s**2)
-    sci = sumall/n
-    wall = n**2/var_num
-    effi_equivalent = n * sci / effi_num 
+        sumall += img * s
+        var_num += 1 / w * (s ** 2)
+        effi_num += img / eff * (s ** 2)
+    sci = sumall / n
+    wall = n ** 2 / var_num
+    effi_equivalent = n * sci / effi_num
 
-    return sci, wall, effi_equivalent   
+    if noise_reals_all is None:
+        return sci, wall, effi_equivalent
+
+    n_real = noise_reals_all[0].shape[0]
+    noise_reals_combined = np.zeros_like(noise_reals_all[0])
+    for nr, s in zip(noise_reals_all, scalearray):
+        noise_reals_combined += nr * s
+    noise_reals_combined /= n
+    return sci, wall, effi_equivalent, noise_reals_combined
+
+
+def finalize_stitched_catalog(cat, stitched_meta):
+    """Drop buffer-ring sources and flag IMCOM-overlap-skirt sources.
+
+    The buffer ring (outside the central block) is dropped entirely — its
+    sources are owned by neighbors and were only modeled to inform the
+    central fits.  The IMCOM-overlap skirt (outer ``block_overlap_px`` pixels
+    of the central block on each side) is *kept*, with bit 0x0100 set so the
+    same physical source can be deduplicated across block catalogs at concat
+    time.
+
+    Pixel coordinates are rewritten to the central-block frame, so x/y
+    range over ``[0, block)`` and a source's overlap status can be recomputed
+    from x/y at any time.
+    """
+    buf      = stitched_meta['buf_px']
+    block    = stitched_meta['block_size_px']
+    overlap  = stitched_meta['block_overlap_px']
+
+    pixel_cols = ('x', 'y', 'xmin', 'xmax', 'ymin', 'ymax',
+                  'xpeak', 'ypeak', 'xcpeak', 'ycpeak')
+    for col in pixel_cols:
+        if col in cat.colnames:
+            cat[col] = cat[col] - buf
+
+    x = np.asarray(cat['x'])
+    y = np.asarray(cat['y'])
+    in_central = (x >= 0) & (x < block) & (y >= 0) & (y < block)
+    cat = cat[in_central]
+
+    x = np.asarray(cat['x'])
+    y = np.asarray(cat['y'])
+    in_overlap_skirt = ((x < overlap) | (x >= block - overlap) |
+                        (y < overlap) | (y >= block - overlap))
+    if 'flag' in cat.colnames:
+        cat['flag'][in_overlap_skirt] |= 0x0100
+    return cat
+
+
+def crop_to_central_fits(fits_path, stitched_meta):
+    """Crop a stitched-canvas FITS image in place to the central block."""
+    if not os.path.exists(fits_path):
+        return
+    buf   = stitched_meta['buf_px']
+    block = stitched_meta['block_size_px']
+    with fits.open(fits_path, mode='update') as hdul:
+        hdu = hdul[0]
+        data = hdu.data
+        if data.ndim == 2:
+            hdu.data = data[buf:buf + block, buf:buf + block]
+        elif data.ndim == 3:
+            hdu.data = data[:, buf:buf + block, buf:buf + block]
+        else:
+            return
+        hdu.header['NAXIS1'] = block
+        hdu.header['NAXIS2'] = block
+        if 'CRPIX1' in hdu.header:
+            hdu.header['CRPIX1'] = float(hdu.header['CRPIX1']) - buf
+        if 'CRPIX2' in hdu.header:
+            hdu.header['CRPIX2'] = float(hdu.header['CRPIX2']) - buf
+        hdul.flush()
 
 
 def match_spatial(cat_ra, cat_dec, truth_ra, truth_dec):

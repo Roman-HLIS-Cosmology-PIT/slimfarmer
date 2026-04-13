@@ -18,7 +18,8 @@ For algorithmic details, derivations, and validation results, see [`docs/researc
 2. **Grouping** — overlapping segmaps (after dilation) are co-fitted as a group to handle blends.
 3. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model. Note that FixedCompositeGalaxy is similar to `Cmodel`, except that the FixedCompositeGalaxy varies both the exponential profile and the dev profile at the same time, while `Cmodel` fits the exponential profile and the dev profile separately.  
 4. **Forced photometry** — morphology is frozen, and only flux is refit; an optional second pass subtracts neighbor models (although this is not the default).
-5. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations.
+5. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations (see [`doc/compute_kappa_implementation.md`](doc/compute_kappa_implementation.md)).
+6. **Rubin forced photometry** (optional) — freeze Roman-derived morphologies and fit flux only on stitched Rubin coadds. See `run_forced_photometry_rubin.py`.
 
 ---
 
@@ -104,6 +105,8 @@ cat = slimfarmer.run_photometry(
 | `noshot` | `False` | If True, use background-only weights for kappa |
 | `ncpus` | `0` | Worker processes (`0` = serial) |
 | `paddingpixel` | `34` | Boundary padding for flagging edge sources |
+| `timeout` | `1200` | Per-group wall-clock limit (seconds). Groups that exceed this return their best-so-far model and are flagged `0x0200` |
+| `roman_pixel_scale_arcsec` | `0.049` | Canonical IMCOM pixel scale; used when overlaying Roman-derived shapes on other images |
 | `save_model_image` | `True` | Write `<output>_model.fits` and `<output>_residual.fits` |
 
 See [`docs/research_note.md`](docs/research_note.md) for the rationale behind decoupling `dilation_radius` and `fit_dilation_radius`.
@@ -139,17 +142,18 @@ See [`docs/research_note.md`](docs/research_note.md) for the rationale behind de
 See [`docs/research_note.md`](docs/research_note.md) for derivations and MC validation.
 
 ### Detection flags
-| Bit | Value | Source |
-|---|---|---|
-| 0 | 1 | Has neighbors (SEP) |
-| 1 | 2 | Was blended (SEP) |
-| 2 | 4 | Saturated pixel (SEP) |
-| 3 | 8 | Truncated at boundary (SEP) |
-| 4 | 16 | Aperture data corrupted (SEP) |
-| 5 | 32 | Isophotal data corrupted (SEP) |
-| 6 | 64 | Memory overflow during deblending (SEP) |
-| 7 | 128 | Memory overflow during extraction (SEP) |
-| 8 | 256 (`0x0100`) | Within `paddingpixel` of image edge (slimfarmer) |
+| Bit | Value | Source | Description |
+|---|---|---|---|
+| 0 | 1 | SEP | Has neighbors |
+| 1 | 2 | SEP | Was blended |
+| 2 | 4 | SEP | Saturated pixel |
+| 3 | 8 | SEP | Truncated at boundary |
+| 4 | 16 | SEP | Aperture data corrupted |
+| 5 | 32 | SEP | Isophotal data corrupted |
+| 6 | 64 | SEP | Memory overflow during deblending |
+| 7 | 128 | SEP | Memory overflow during extraction |
+| 8 | 256 (`0x0100`) | slimfarmer | IMCOM overlap skirt — within `paddingpixel` of block edge. Duplicate exists in the neighbor block's main region; dropped by `concatenate_blocks.py` for lossless deduplication |
+| 9 | 512 (`0x0200`) | slimfarmer | Group hit per-group timeout (`config.timeout`). Source has a valid model from the last completed stage but may lack full model selection or forced photometry. Dropped by `concatenate_blocks.py` by default; pass `--flag_bit 0x0100` to keep |
 
 ---
 
@@ -233,6 +237,8 @@ Shows science image, weight map, model, chi residuals, and radial profile.
 | `docs/tutorial.ipynb` | End-to-end walkthrough: CPR → images → photometry → diagnostics |
 | `docs/demo.ipynb` | Quick demo with pre-prepared FITS files |
 | `docs/Flux_error_validation_colab.ipynb` | Flux error MC validation [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Roman-HLIS-Cosmology-PIT/slimfarmer/blob/main/doc/Flux_error_validation_colab.ipynb) |
+| `docs/forced_photometry_tutorial.ipynb` | Rubin forced photometry: stitching, seg-map groups, position priors |
+| `docs/compute_kappa_implementation.md` | How `compute_kappa` works: correlated-noise correction, memory tricks, FFT/sparse hybrid |
 
 ---
 

@@ -456,9 +456,10 @@ class FarmerImage:
         self.logger.info(f'Processing {len(group_ids)} groups (ncpus={self.config.ncpus})...')
 
         if self.config.ncpus == 0 or len(group_ids) == 1:
+            timeout = self.config.timeout
             for gid in _tqdm.tqdm(group_ids, desc='Groups'):
                 g = self._spawn_group(gid)
-                self._absorb(_process_group(g))
+                self._absorb(_process_group(g, timeout=timeout))
         else:
             import os as _os
             for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
@@ -470,21 +471,22 @@ class FarmerImage:
                 saved[band] = {}
                 for key in ('noise_corr', 'noise_reals_path'):
                     saved[band][key] = self.band_config[band].pop(key, None)
+            timeout = self.config.timeout
             groups = [self._spawn_group(gid) for gid in group_ids]
             pool = mp.Pool(processes=self.config.ncpus, maxtasksperchild=20)
-            async_results = [pool.apply_async(_process_group, (g,)) for g in groups]
+            async_results = [pool.apply_async(_process_group, (g, timeout))
+                             for g in groups]
             del groups
             pool.close()
             pbar = _tqdm.tqdm(total=len(async_results), desc='Groups')
             for ar in async_results:
                 try:
-                    result = ar.get(timeout=self.config.timeout)
+                    result = ar.get()
                     self._absorb(result)
                 except Exception:
                     pass
                 pbar.update(1)
             pbar.close()
-            pool.terminate()
             pool.join()
             for band in self.band_config:
                 for key, val in saved[band].items():
@@ -526,14 +528,60 @@ class FarmerImage:
 
     # ── Post-fit correlated-noise kappa ─────────────────────────────────────
 
+    # Crossover: N² < Npix·log2(Npix) ⟹ sparse wins. For a 2354² image
+    # that's N < ~sqrt(2354² · 21) ≈ 10800. We use a conservative 3000
+    # so the sparse path stays comfortably fast even with the Python loop.
+    _KAPPA_SPARSE_CUTOFF = 3000
+
+    @staticmethod
+    def _kappa_for_source(cache, noise_corr, ny, nx, Rk=None,
+                          sparse_cutoff=3000):
+        """Compute kappa for one source — hybrid sparse / FFT.
+
+        For N < ``sparse_cutoff`` nonzero pixels uses a direct O(N²)
+        double-sum; for larger groups falls back to the O(Npix log Npix)
+        FFT convolution path. ``Rk`` (precomputed ``rfft2(noise_corr)``)
+        must be supplied when the FFT path might be needed.
+        """
+        h_vals = cache['h_vals'].astype(np.float64)
+        nzy = cache['nzy'].astype(np.intp)
+        nzx = cache['nzx'].astype(np.intp)
+        D = cache['D']
+        N = len(h_vals)
+        if N == 0 or D <= 0:
+            return 1.0
+
+        if N < sparse_cutoff:
+            hTRh = 0.0
+            for i in range(N):
+                dy_i = (nzy[i] - nzy) % ny
+                dx_i = (nzx[i] - nzx) % nx
+                hTRh += h_vals[i] * float(np.dot(h_vals, noise_corr[dy_i, dx_i]))
+        else:
+            H = np.zeros((ny, nx), dtype=np.float64)
+            np.add.at(H, (nzy % ny, nzx % nx), h_vals)
+            Hk = np.fft.rfft2(H)
+            if Rk is None:
+                Rk = np.fft.rfft2(noise_corr)
+            conv = np.fft.irfft2(Rk * Hk, s=(ny, nx))
+            hTRh = float(np.sum(H * conv))
+
+        kappa_sq = hTRh / D
+        return np.sqrt(max(kappa_sq, 1.0))
+
     def compute_kappa(self):
         """Compute kappa using cached h data.
 
-        For noshot=True: uses noise_corr from init (sigma_bg, exact).
-        For noshot=False: re-estimates r with sigma_total, one band at
-        a time, freeing memory between bands.
+        Uses a hybrid strategy per source: sparse O(N²) double-sum for
+        small groups (N < ``_KAPPA_SPARSE_CUTOFF``), FFT convolution for
+        large groups. Parallelised over sources via ThreadPoolExecutor
+        when ``config.ncpus > 0``.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import gc
+
+        ncpus = getattr(self.config, 'ncpus', 0)
+        cutoff = self._KAPPA_SPARSE_CUTOFF
 
         for band in self.bands:
             bc = self.band_config[band]
@@ -542,33 +590,49 @@ class FarmerImage:
                 continue
             ny, nx = noise_corr.shape
 
-            # noise_corr from init already uses sigma estimated from
-            # the realizations themselves, so no re-estimation needed.
-            # Rk depends only on the band, not on the source — hoist it.
+            # Precompute Rk once per band for the FFT fallback path
             Rk = np.fft.rfft2(noise_corr)
 
-            for source_id, model in _tqdm.tqdm(self.model_catalog.items()):
+            # Collect work items: (source_id, cache)
+            work = []
+            for source_id, model in self.model_catalog.items():
                 if not hasattr(model, 'flux_err_noisereal_kappa'):
                     model.flux_err_noisereal_kappa = {}
-
                 cache = getattr(model, '_kappa_cache', {}).get(band)
                 if cache is None:
                     model.flux_err_noisereal_kappa[band] = 1.0
-                    continue
+                else:
+                    work.append((source_id, cache))
 
-                h_vals = cache['h_vals'].astype(np.float64)
-                nzy = cache['nzy'].astype(np.intp)
-                nzx = cache['nzx'].astype(np.intp)
-                D = cache['D']
+            if not work:
+                continue
 
-                H = np.zeros((ny, nx), dtype=np.float64)
-                np.add.at(H, (nzy % ny, nzx % nx), h_vals)
-                Hk = np.fft.rfft2(H)
-                conv = np.fft.irfft2(Rk * Hk, s=(ny, nx))
-                hTRh = float(np.sum(H * conv))
+            n_fft = sum(1 for _, c in work if len(c['h_vals']) >= cutoff)
+            self.logger.info(f'[{band}] kappa: {len(work)} sources '
+                             f'({len(work) - n_fft} sparse, {n_fft} FFT)')
 
-                kappa_sq = hTRh / D
-                model.flux_err_noisereal_kappa[band] = np.sqrt(max(kappa_sq, 1.0))
+            if ncpus > 0:
+                results = {}
+                with ThreadPoolExecutor(max_workers=ncpus) as pool:
+                    futures = {
+                        pool.submit(self._kappa_for_source,
+                                    cache, noise_corr, ny, nx,
+                                    Rk=Rk, sparse_cutoff=cutoff): sid
+                        for sid, cache in work
+                    }
+                    for fut in _tqdm.tqdm(as_completed(futures),
+                                          total=len(futures),
+                                          desc=f'Kappa {band}'):
+                        sid = futures[fut]
+                        results[sid] = fut.result()
+                for sid, kappa in results.items():
+                    self.model_catalog[sid].flux_err_noisereal_kappa[band] = kappa
+            else:
+                for sid, cache in _tqdm.tqdm(work, desc=f'Kappa {band}'):
+                    kappa = self._kappa_for_source(
+                        cache, noise_corr, ny, nx,
+                        Rk=Rk, sparse_cutoff=cutoff)
+                    self.model_catalog[sid].flux_err_noisereal_kappa[band] = kappa
 
             del noise_corr, Rk; gc.collect()
 
@@ -741,6 +805,19 @@ class FarmerImage:
             if unfit.any():
                 catalog['name'][unfit] = 'Bad'
 
+        # Flag sources whose group hit the timeout deadline (0x0200).
+        # They have valid models from the last completed stage but may
+        # not have gone through full model selection or forced photometry.
+        from ._group import FLAG_TIMEOUT
+        for source_id, tracker in self.model_tracker.items():
+            stages = [k for k in tracker if isinstance(k, int)]
+            if not stages:
+                continue
+            if tracker[max(stages)].get('timed_out', False):
+                row_mask = catalog['id'] == source_id
+                if 'flag' in catalog.colnames:
+                    catalog['flag'][row_mask] |= FLAG_TIMEOUT
+
         return catalog
 
     def write_catalog(self, path, overwrite=True):
@@ -771,10 +848,19 @@ class FarmerImage:
             band = self.detection_band
         bc = self.band_config[band]
 
-        sources = [copy.deepcopy(m) for m in self.model_catalog.values()
-                   if hasattr(m, 'pos')]
+        sources = []
+        for m in self.model_catalog.values():
+            if not hasattr(m, 'pos'):
+                continue
+            try:
+                f = m.getBrightness().getFlux(band)
+                if f is None:
+                    continue
+            except Exception:
+                continue
+            sources.append(copy.deepcopy(m))
         if not sources:
-            self.logger.warning('No fitted sources in model_catalog — returning zero model.')
+            self.logger.warning(f'No sources with valid {band} flux — returning zero model.')
             return np.zeros_like(bc['science'])
 
         timg = TImage(

@@ -32,6 +32,7 @@ from ._group import _Group, _process_group, _process_group_second_pass
 from .utils import (clean_catalog, dilate_and_group, get_detection_kernel,
                     get_params, segmap_to_dict)
 from .config import Config
+from .flags import FLAG_BOUNDARY, FLAG_TIMEOUT, FLAG_SINGLETON_FALLBACK
 
 
 def _sys_byteorder():
@@ -201,12 +202,18 @@ class FarmerImage:
         catalog.add_column(sky[0] * u.deg, name='ra', index=1)
         catalog.add_column(sky[1] * u.deg, name='dec', index=2)
 
-        radius_arcsec = cfg.dilation_radius.to(u.arcsec).value
-        radius_px = round(radius_arcsec / self.pixel_scale.to(u.arcsec).value)
-        self.logger.info(f'Grouping with dilation radius {radius_arcsec:.2f}" = {radius_px} px')
+        if cfg.dilation_radius is None:
+            self.logger.info('Grouping disabled: one source per group.')
+            group_ids = np.asarray(catalog['id'], dtype=np.int32)
+            group_pops = np.ones(len(catalog), dtype=np.int16)
+            groupmap = segmap.copy()
+        else:
+            radius_arcsec = cfg.dilation_radius.to(u.arcsec).value
+            radius_px = round(radius_arcsec / self.pixel_scale.to(u.arcsec).value)
+            self.logger.info(f'Grouping with dilation radius {radius_arcsec:.2f}" = {radius_px} px')
 
-        group_ids, group_pops, groupmap = dilate_and_group(
-            catalog, segmap, radius=radius_px, fill_holes=True)
+            group_ids, group_pops, groupmap = dilate_and_group(
+                catalog, segmap, radius=radius_px, fill_holes=True)
 
         catalog.add_column(group_ids, name='group_id', index=3)
         catalog.add_column(group_pops, name='group_pop', index=4)
@@ -216,7 +223,7 @@ class FarmerImage:
         pad = cfg.paddingpixel
         near_boundary = ((catalog['x'] < pad) | (catalog['x'] >= nx - pad) |
                          (catalog['y'] < pad) | (catalog['y'] >= ny - pad))
-        catalog['flag'][near_boundary] |= 0x0100
+        catalog['flag'][near_boundary] |= FLAG_BOUNDARY
 
         self.catalog = catalog
         self.segmap = segmap
@@ -472,22 +479,100 @@ class FarmerImage:
                 for key in ('noise_corr', 'noise_reals_path'):
                     saved[band][key] = self.band_config[band].pop(key, None)
             timeout = self.config.timeout
+            # Hard wall-clock ceiling per task. When a worker hangs in a C
+            # extension (Ceres) and ignores the cooperative `timeout` deadline,
+            # ar.get() would otherwise block forever — this cap lets us skip
+            # the stuck task and move on.
+            stuck_ceiling = self.config.stuck_ceiling
             groups = [self._spawn_group(gid) for gid in group_ids]
             pool = mp.Pool(processes=self.config.ncpus, maxtasksperchild=20)
-            async_results = [pool.apply_async(_process_group, (g, timeout))
-                             for g in groups]
-            del groups
-            pool.close()
-            pbar = _tqdm.tqdm(total=len(async_results), desc='Groups')
-            for ar in async_results:
-                try:
-                    result = ar.get()
-                    self._absorb(result)
-                except Exception:
-                    pass
-                pbar.update(1)
-            pbar.close()
-            pool.join()
+            stuck_gids = []
+            try:
+                async_results = [pool.apply_async(_process_group, (g, timeout))
+                                 for g in groups]
+                del groups
+                pool.close()
+                pbar = _tqdm.tqdm(total=len(async_results), desc='Groups')
+                n_stuck = 0
+                for gid, ar in zip(group_ids, async_results):
+                    try:
+                        result = ar.get(timeout=stuck_ceiling)
+                        self._absorb(result)
+                    except mp.TimeoutError:
+                        n_stuck += 1
+                        stuck_gids.append(int(gid))
+                    except Exception:
+                        pass
+                    pbar.update(1)
+                pbar.close()
+                if n_stuck:
+                    self.logger.warning(
+                        f'{n_stuck} group(s) exceeded {stuck_ceiling}s '
+                        f'hard ceiling and were skipped (worker hang).')
+            finally:
+                # terminate first: workers may hang in C-extension finalizers,
+                # and all results have already been collected above.
+                pool.terminate()
+                pool.join()
+
+            # Singleton-fallback retry for hard-stuck groups: the soft-deadline
+            # fallback inside _process_group can't fire for workers hung in a
+            # C extension because the function never returns. Re-submit each
+            # source of each stuck group as an independent one-source _Group
+            # in a fresh pool with the same hard ceiling.
+            if stuck_gids and getattr(self.config, 'singleton_fallback', True):
+                from ._group import _make_singleton_group
+                singletons = []  # list of (singleton_Group, parent_gid, sid)
+                for gid in stuck_gids:
+                    parent = self._spawn_group(gid)
+                    if getattr(parent, 'rejected', False) or len(parent.source_ids) == 0:
+                        continue
+                    for sid in parent.source_ids:
+                        s = _make_singleton_group(parent, int(sid))
+                        if s is not None:
+                            singletons.append((s, int(gid), int(sid)))
+                if singletons:
+                    self.logger.info(
+                        f'Retrying {len(singletons)} sources from {len(stuck_gids)} '
+                        f'stuck group(s) as singletons...')
+                    pool2 = mp.Pool(processes=self.config.ncpus, maxtasksperchild=5)
+                    try:
+                        async2 = [pool2.apply_async(_process_group, (s, timeout))
+                                  for s, _, _ in singletons]
+                        pool2.close()
+                        n_saved = 0
+                        pbar2 = _tqdm.tqdm(total=len(async2), desc='Singletons')
+                        for (_, parent_gid, sid), ar in zip(singletons, async2):
+                            try:
+                                result = ar.get(timeout=stuck_ceiling)
+                            except mp.TimeoutError:
+                                pbar2.update(1)
+                                continue
+                            except Exception:
+                                pbar2.update(1)
+                                continue
+                            self._absorb(result)
+                            # Re-attribute to the original parent group.
+                            if sid in self.model_catalog:
+                                self.model_catalog[sid].group_id = parent_gid
+                            # Mark tracker so build_catalog sets both
+                            # FLAG_TIMEOUT and FLAG_SINGLETON_FALLBACK.
+                            if sid in self.model_tracker:
+                                stages = [k for k in self.model_tracker[sid]
+                                          if isinstance(k, int)]
+                                if stages:
+                                    last = self.model_tracker[sid][max(stages)]
+                                    last['singleton_fallback'] = True
+                                    last['timed_out'] = True
+                            n_saved += 1
+                            pbar2.update(1)
+                        pbar2.close()
+                        self.logger.info(
+                            f'Singleton fallback recovered {n_saved}/'
+                            f'{len(async2)} sources.')
+                    finally:
+                        pool2.terminate()
+                        pool2.join()
             for band in self.band_config:
                 for key, val in saved[band].items():
                     if val is not None:
@@ -805,18 +890,23 @@ class FarmerImage:
             if unfit.any():
                 catalog['name'][unfit] = 'Bad'
 
-        # Flag sources whose group hit the timeout deadline (0x0200).
-        # They have valid models from the last completed stage but may
-        # not have gone through full model selection or forced photometry.
-        from ._group import FLAG_TIMEOUT
+        # Flag sources whose group hit the timeout deadline. They have
+        # valid models from the last completed stage but may not have
+        # gone through full model selection or forced photometry.
+        # Sources re-fit via the singleton fallback additionally carry
+        # FLAG_SINGLETON_FALLBACK.
         for source_id, tracker in self.model_tracker.items():
             stages = [k for k in tracker if isinstance(k, int)]
             if not stages:
                 continue
-            if tracker[max(stages)].get('timed_out', False):
-                row_mask = catalog['id'] == source_id
-                if 'flag' in catalog.colnames:
-                    catalog['flag'][row_mask] |= FLAG_TIMEOUT
+            last = tracker[max(stages)]
+            row_mask = catalog['id'] == source_id
+            if 'flag' not in catalog.colnames:
+                continue
+            if last.get('timed_out', False):
+                catalog['flag'][row_mask] |= FLAG_TIMEOUT
+            if last.get('singleton_fallback', False):
+                catalog['flag'][row_mask] |= FLAG_SINGLETON_FALLBACK
 
         return catalog
 

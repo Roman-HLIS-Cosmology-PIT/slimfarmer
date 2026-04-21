@@ -19,13 +19,31 @@ class Config:
     clean_param = 1.0
     pixstack_size = 20_000_000
     use_detection_weight = True
-    # Grouping
+    # Grouping. Set to None to disable grouping entirely (one source per group,
+    # even if their SEP segmaps touch). Set to 0*u.arcsec to label by raw
+    # segmap adjacency without dilation.
     dilation_radius = 0.2 * u.arcsec
     group_buffer = 0.01 * u.arcsec
     group_size_limit = 100
     fit_dilation_radius = 0.2 * u.arcsec  # expand fitting region beyond groupmap to capture profile wings
-    timeout=2000
+    timeout=1000
+    # Hard wall-clock ceiling per task (seconds). When a worker hangs inside a
+    # C extension and ignores the cooperative `timeout` deadline, the parent
+    # gives up on that task after this many seconds and moves on.
+    stuck_ceiling = 600
     paddingpixel = 34
+    # When a group hits the timeout, retry each source as an independent
+    # single-source fit. Disable to keep the old behavior of accepting the
+    # partial joint-fit result from the last completed stage.
+    singleton_fallback = True
+    # Dominant-source prefit: if a group contains one source whose SEP segmap
+    # is much larger than any sibling's, solo-fit that source first, then run
+    # the joint fit with the dominant source's parameters frozen. This prevents
+    # neighbors from stealing the dominant source's wing flux during joint
+    # optimization (a common failure on bright extended galaxies).
+    dominant_prefit = True
+    dominant_npix_ratio = 3.0  # dominant.npix must exceed ratio × 2nd-largest.npix
+    dominant_npix_min = 500    # absolute minimum npix for "dominant" qualification
 
     # Background
     subtract_background = False

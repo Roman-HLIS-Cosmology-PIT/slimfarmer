@@ -15,11 +15,13 @@ For algorithmic details, derivations, and validation results, see [`docs/researc
 ## Pipeline overview
 
 1. **Detection** — single SEP pass produces a source catalog and segmentation map (no iterative re-detection).
-2. **Grouping** — overlapping segmaps (after dilation) are co-fitted as a group to handle blends.
-3. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model. Note that FixedCompositeGalaxy is similar to `Cmodel`, except that the FixedCompositeGalaxy varies both the exponential profile and the dev profile at the same time, while `Cmodel` fits the exponential profile and the dev profile separately.  
-4. **Forced photometry** — morphology is frozen, and only flux is refit; an optional second pass subtracts neighbor models (although this is not the default).
-5. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations (see [`doc/compute_kappa_implementation.md`](doc/compute_kappa_implementation.md)).
-6. **Rubin forced photometry** (optional) — freeze Roman-derived morphologies and fit flux only on stitched Rubin coadds. See `run_forced_photometry_rubin.py`.
+2. **Grouping** — overlapping segmaps (after dilation) are co-fitted as a group to handle blends. Set `dilation_radius = None` to disable grouping entirely (each source is fit in isolation, regardless of segmap adjacency).
+3. **Dominant-source prefit** (default on, `dominant_prefit=True`) — when a group contains one source whose SEP segmap is much larger than any sibling's (`npix_dominant > dominant_npix_ratio × 2nd_largest_npix` and `≥ dominant_npix_min`), that source is solo-fit first, then the joint fit runs with its parameters frozen. This prevents neighbors from stealing the dominant source's wing flux during joint optimization — the dominant failure mode for bright extended galaxies.
+4. **Model selection** — for each group, Tractor tries `PointSource → SimpleGalaxy → ExpGalaxy / DevGalaxy → FixedCompositeGalaxy` and picks the simplest acceptable model. Note that FixedCompositeGalaxy is similar to `Cmodel`, except that the FixedCompositeGalaxy varies both the exponential profile and the dev profile at the same time, while `Cmodel` fits the exponential profile and the dev profile separately.
+5. **Forced photometry** — morphology is frozen, and only flux is refit; an optional second pass subtracts neighbor models (although this is not the default).
+6. **Timeout recovery** — groups whose joint fit exceeds `config.timeout` (soft) or the hard pool ceiling retry each source as an independent singleton (default on, `singleton_fallback=True`). Recovered sources are flagged `FLAG_TIMEOUT | FLAG_SINGLETON_FALLBACK`.
+7. **Kappa correction** — correlated-noise inflation factor applied per source from noise realizations (see [`doc/compute_kappa_implementation.md`](doc/compute_kappa_implementation.md)).
+8. **Rubin forced photometry** (optional) — freeze Roman-derived morphologies and fit flux only on stitched Rubin coadds. See `run_forced_photometry_rubin.py`.
 
 ---
 
@@ -96,16 +98,21 @@ cat = slimfarmer.run_photometry(
 |---|---|---|
 | `thresh` | `3.0` | SEP detection threshold (× background RMS) |
 | `minarea` | `5` | Minimum source area in pixels |
-| `dilation_radius` | `0.2"` | Segmap dilation for grouping |
+| `dilation_radius` | `0.2"` | Segmap dilation for grouping. `None` disables grouping (one source per group, regardless of segmap adjacency); `0*u.arcsec` disables dilation but still groups adjacent segmaps |
 | `fit_dilation_radius` | `0.2"` | Fitting footprint expansion (captures profile wings) |
 | `group_buffer` | `0.01"` | Extra padding around each group cutout |
 | `group_size_limit` | `10` | Skip groups larger than this |
+| `dominant_prefit` | `True` | Solo-fit a group's dominant source first, then run the joint fit with it frozen (prevents neighbor flux stealing) |
+| `dominant_npix_ratio` | `3.0` | Dominant qualification: `npix_dominant` must exceed `ratio × 2nd_largest_npix` |
+| `dominant_npix_min` | `500` | Absolute minimum `npix` for dominant qualification |
+| `singleton_fallback` | `True` | On timeout, retry each source as an independent one-source fit in a fresh pool |
 | `neighbor_subtraction` | `False` | Two-pass mode that subtracts neighbor models |
 | `neighbor_radius` | `5.0"` | Radius for neighbor subtraction |
 | `noshot` | `False` | If True, use background-only weights for kappa |
 | `ncpus` | `0` | Worker processes (`0` = serial) |
 | `paddingpixel` | `34` | Boundary padding for flagging edge sources |
 | `timeout` | `1200` | Per-group wall-clock limit (seconds). Groups that exceed this return their best-so-far model and are flagged `0x0200` |
+| `stuck_ceiling` | `600` | Hard wall-clock ceiling (seconds). When a worker hangs inside a C extension and ignores the cooperative `timeout`, the parent abandons the task after this many seconds and — if `singleton_fallback` is on — retries each of the stuck group's sources as a singleton |
 | `roman_pixel_scale_arcsec` | `0.049` | Canonical IMCOM pixel scale; used when overlaying Roman-derived shapes on other images |
 | `save_model_image` | `True` | Write `<output>_model.fits` and `<output>_residual.fits` |
 
@@ -152,8 +159,11 @@ See [`docs/research_note.md`](docs/research_note.md) for derivations and MC vali
 | 5 | 32 | SEP | Isophotal data corrupted |
 | 6 | 64 | SEP | Memory overflow during deblending |
 | 7 | 128 | SEP | Memory overflow during extraction |
-| 8 | 256 (`0x0100`) | slimfarmer | IMCOM overlap skirt — within `paddingpixel` of block edge. Duplicate exists in the neighbor block's main region; dropped by `concatenate_blocks.py` for lossless deduplication |
-| 9 | 512 (`0x0200`) | slimfarmer | Group hit per-group timeout (`config.timeout`). Source has a valid model from the last completed stage but may lack full model selection or forced photometry. Dropped by `concatenate_blocks.py` by default; pass `--flag_bit 0x0100` to keep |
+| 8 | 256 (`0x0100`) | slimfarmer | `FLAG_BOUNDARY` — IMCOM overlap skirt, within `paddingpixel` of block edge. Duplicate exists in the neighbor block's main region; dropped by `concatenate_blocks.py` for lossless deduplication |
+| 9 | 512 (`0x0200`) | slimfarmer | `FLAG_TIMEOUT` — group hit per-group `timeout` (soft deadline) or `stuck_ceiling` (hard wall-clock). Source has a valid model from the last completed stage but may lack full model selection or forced photometry. Dropped by `concatenate_blocks.py` by default; pass `--flag_bit 0x0100` to keep |
+| 10 | 1024 (`0x0400`) | slimfarmer | `FLAG_SINGLETON_FALLBACK` — source was re-fit as an independent one-source group after its original joint fit timed out. Always set together with `FLAG_TIMEOUT`; a set `FLAG_SINGLETON_FALLBACK` means the model is the singleton result (usually trustworthy), an unset one means the model is the partial joint-fit result |
+
+All flag constants live in `slimfarmer/flags.py` and are re-exported from the package root (`slimfarmer.FLAG_TIMEOUT` etc.).
 
 ---
 

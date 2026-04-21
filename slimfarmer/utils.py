@@ -17,6 +17,8 @@ from tractor import ConstantFitsWcs
 from astropy.wcs import WCS
 from astropy.nddata import Cutout2D
 
+from .flags import FLAG_BOUNDARY
+
 
 
 class SimpleGalaxy(ExpGalaxy):
@@ -813,9 +815,9 @@ def finalize_stitched_catalog(cat, stitched_meta):
     The buffer ring (outside the central block) is dropped entirely — its
     sources are owned by neighbors and were only modeled to inform the
     central fits.  The IMCOM-overlap skirt (outer ``block_overlap_px`` pixels
-    of the central block on each side) is *kept*, with bit 0x0100 set so the
-    same physical source can be deduplicated across block catalogs at concat
-    time.
+    of the central block on each side) is *kept*, with FLAG_BOUNDARY set so
+    the same physical source can be deduplicated across block catalogs at
+    concat time.
 
     Pixel coordinates are rewritten to the central-block frame, so x/y
     range over ``[0, block)`` and a source's overlap status can be recomputed
@@ -841,7 +843,7 @@ def finalize_stitched_catalog(cat, stitched_meta):
     in_overlap_skirt = ((x < overlap) | (x >= block - overlap) |
                         (y < overlap) | (y >= block - overlap))
     if 'flag' in cat.colnames:
-        cat['flag'][in_overlap_skirt] |= 0x0100
+        cat['flag'][in_overlap_skirt] |= FLAG_BOUNDARY
     return cat
 
 

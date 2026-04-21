@@ -33,6 +33,8 @@ from .config import Config
 from .image import FarmerImage, run_photometry
 from .utils import (SimpleGalaxy, prepare_images_from_cpr, prepare_stitched_block,
                     meanall_new, finalize_stitched_catalog, crop_to_central_fits)
+from . import flags
+from .flags import FLAG_BOUNDARY, FLAG_TIMEOUT, FLAG_SINGLETON_FALLBACK
 from .track import track_source, _get_flux_converters
 from .diag import diagnose_source
 from .forced import (forced_photometry, reconstruct_source, load_psf,
@@ -46,4 +48,5 @@ __all__ = ['Config', 'FarmerImage', 'run_photometry', 'SimpleGalaxy',
            'prepare_images_from_cpr', 'prepare_stitched_block',
            'track_source', '_get_flux_converters',
            'diagnose_source',
-           'forced_photometry', 'reconstruct_source', 'load_psf']
+           'forced_photometry', 'reconstruct_source', 'load_psf',
+           'flags', 'FLAG_BOUNDARY', 'FLAG_TIMEOUT', 'FLAG_SINGLETON_FALLBACK']

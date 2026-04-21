@@ -591,7 +591,72 @@ class _Group:
                     self.model_catalog[sid].statistics = tracker[st]
                     break
 
-    def determine_models(self, deadline=None):
+    def _seed_presolved(self, pre_solved):
+        """Install pre-fitted models for a subset of sources and mark them solved.
+
+        Caches the pre-fit models in ``self._pre_solved_models`` so they can
+        be restored after each ``_stage_models`` call (which would otherwise
+        rebuild them from SEP seeds every stage).
+
+        Returns the set of sids that were successfully seeded.
+        """
+        self._pre_solved_models = {}
+        frozen_sids = set()
+        if not pre_solved:
+            return frozen_sids
+        for sid, model in pre_solved.items():
+            if model is None:
+                continue
+            try:
+                idx = int(np.where(self.source_ids == sid)[0][0])
+            except Exception:
+                continue
+            self.model_catalog[sid] = copy.deepcopy(model)
+            self.solved[idx] = True
+            cur = self.model_tracker.get(sid, {})
+            cur_stage = self.stage if self.stage is not None else 0
+            cur[cur_stage] = {'model': copy.deepcopy(model), 'prefit': True}
+            self.model_tracker[sid] = cur
+            self._pre_solved_models[int(sid)] = copy.deepcopy(model)
+            frozen_sids.add(int(sid))
+        return frozen_sids
+
+    def _restore_presolved(self, frozen_sids):
+        """Overwrite ``model_catalog[sid]`` with the cached pre-fit model.
+
+        Called right after ``_stage_models`` each stage so the pre-solved
+        sources keep their solo-fit parameters instead of being rebuilt
+        from SEP seeds.
+        """
+        cache = getattr(self, '_pre_solved_models', {})
+        for sid in frozen_sids:
+            m = cache.get(sid)
+            if m is not None:
+                self.model_catalog[sid] = copy.deepcopy(m)
+
+    def _freeze_presolved(self, frozen_sids):
+        """Freeze all params of pre-solved sources; return list of frozen models."""
+        frozen_models = []
+        for sid in frozen_sids:
+            m = self.model_catalog.get(sid)
+            if m is None:
+                continue
+            try:
+                m.freezeAllParams()
+                frozen_models.append(m)
+            except Exception:
+                pass
+        return frozen_models
+
+    @staticmethod
+    def _thaw_models(models):
+        for m in models:
+            try:
+                m.thawAllParams()
+            except Exception:
+                pass
+
+    def determine_models(self, deadline=None, pre_solved=None):
         """Run model-type selection on the configured modeling bands (Stages 1–5+).
 
         If ``deadline`` (absolute ``time.time()``) is set, the method checks
@@ -599,6 +664,12 @@ class _Group:
         the last completed stage is recovered into model_catalog, so the
         caller always gets something usable (just at an earlier model stage,
         e.g. PointSource instead of ExpGalaxy).
+
+        If ``pre_solved`` (dict ``{sid: fitted_model}``) is given, those sources
+        are pre-seeded into ``model_catalog``, marked solved, and have all
+        their parameters frozen during every joint optimization — they act as
+        static contributors whose flux/shape won't be perturbed by neighbors.
+        Used by the dominant-prefit pathway to prevent flux stealing.
         """
         self.model_priors_active = self.config.model_priors
         self._reset_models()
@@ -608,6 +679,7 @@ class _Group:
         self._stage_images(bands=bands_ordered)
         if not self.images:
             return False
+        frozen_sids = self._seed_presolved(pre_solved)
         tstart = time.time()
         while not self.solved.all():
             if deadline is not None and time.time() > deadline:
@@ -619,12 +691,15 @@ class _Group:
             self.stage += 1
             self._add_tracker()
             self._stage_models()
+            self._restore_presolved(frozen_sids)
             self.engine = Tractor(list(self.images.values()),
                                   [self.model_catalog[sid] for sid in self.source_ids
                                    if sid in self.model_catalog])
             self.engine.bands = list(self.images.keys())
             self.engine.freezeParam('images')
+            frozen_models = self._freeze_presolved(frozen_sids)
             ok = self._optimize(deadline=deadline)
+            self._thaw_models(frozen_models)
             if not ok:
                 return False
             self._measure_stats(self.stage)
@@ -638,12 +713,15 @@ class _Group:
         self.stage += 1
         self._add_tracker()
         self._stage_models()
+        self._restore_presolved(frozen_sids)
         self.engine = Tractor(list(self.images.values()),
                               [self.model_catalog[sid] for sid in self.source_ids
                                if sid in self.model_catalog])
         self.engine.bands = list(self.images.keys())
         self.engine.freezeParam('images')
+        frozen_models = self._freeze_presolved(frozen_sids)
         ok = self._optimize(deadline=deadline)
+        self._thaw_models(frozen_models)
         if not ok:
             return False
         self._measure_stats(self.stage)
@@ -1041,13 +1119,17 @@ class _Group:
             except Exception as e:
                 self.logger.debug(f'Neighbor subtraction failed for band {band}: {e}')
 
-    def force_models(self, neighboring_models=None, deadline=None):
+    def force_models(self, neighboring_models=None, deadline=None, pre_solved=None):
         """
         Forced photometry: freeze shape parameters, re-fit flux in all bands.
 
         Detection band is staged first so chi statistics are computed for it.
         If neighboring_models is provided, their PSF-convolved contributions are
         subtracted from the image data before fitting (neighbor subtraction pass).
+
+        If ``pre_solved`` (dict ``{sid: fitted_model}``) is given, those sources
+        keep their seeded models and have all params frozen during the flux
+        refit — neighbors fit around them.
 
         If any step fails, model_catalog is restored from the pre-force-models
         state so that determine_models results are never lost.
@@ -1073,17 +1155,24 @@ class _Group:
             return False
         if neighboring_models:
             self._subtract_neighbor_contributions(neighboring_models)
+        frozen_sids = self._seed_presolved(pre_solved)
         self._stage_models()
+        self._restore_presolved(frozen_sids)
         self.stage = 11
         self._add_tracker()
         self._update_models()
+        # Re-restore pre_solved after _update_models (which rebuilds from
+        # existing_model_catalog and applies phot_priors).
+        self._restore_presolved(frozen_sids)
         self.engine = Tractor(list(self.images.values()),
                               [self.model_catalog[sid] for sid in self.source_ids
                                if sid in self.model_catalog])
         self.engine.bands = list(self.images.keys())
         self.engine.freezeParam('images')
         self._measure_stats(10)
+        frozen_models = self._freeze_presolved(frozen_sids)
         ok = self._optimize(deadline=deadline)
+        self._thaw_models(frozen_models)
         if not ok:
             self.model_catalog = self.existing_model_catalog
             # Still compute flux errors from the determine_models engine state
@@ -1104,7 +1193,109 @@ class _Group:
         self._cache_kappa_data()
         return True
 
-FLAG_TIMEOUT = 0x0200
+def _find_dominant_source(group, ratio_threshold, min_npix):
+    """Return the sid of the dominant source in ``group``, or None.
+
+    A source qualifies as "dominant" when its SEP segmap (``npix``) exceeds
+    ``ratio_threshold`` × second-largest npix in the group, and is itself at
+    least ``min_npix`` pixels. Requires ``npix`` column to be present.
+    """
+    if len(group.source_ids) < 2:
+        return None
+    if 'npix' not in group.catalog.colnames:
+        return None
+    npix = np.asarray(group.catalog['npix'], dtype=int)
+    ids = np.asarray(group.catalog['id'], dtype=int)
+    order = np.argsort(npix)[::-1]
+    n1, n2 = int(npix[order[0]]), int(npix[order[1]])
+    if n1 < min_npix:
+        return None
+    if n1 < ratio_threshold * max(n2, 1):
+        return None
+    return int(ids[order[0]])
+
+
+def _prefit_dominant(parent, dom_sid, deadline=None):
+    """Fit the dominant source in isolation and return its final model.
+
+    Used to obtain a neighbor-free estimate of the dominant source's shape and
+    flux before handing it to the joint group fit as a frozen contributor.
+    Returns None if the solo fit fails or doesn't produce a usable model.
+    """
+    singleton = _make_singleton_group(parent, dom_sid)
+    if singleton is None:
+        return None
+    try:
+        ok = singleton.determine_models(deadline=deadline)
+        if ok and (deadline is None or time.time() <= deadline):
+            singleton.force_models(deadline=deadline)
+    except Exception:
+        return None
+    m = singleton.model_catalog.get(dom_sid)
+    if m is None or not hasattr(m, 'pos'):
+        return None
+    return m
+
+
+def _make_singleton_group(parent, sid):
+    """Build a single-source _Group that shares parent's image data.
+
+    The source's own segmap footprint is used as both ``segmap_local`` and
+    ``groupmap_local``, so the fit region is the source footprint dilated by
+    ``fit_dilation_radius`` (with everything else masked out).
+    """
+    mask = np.asarray(parent.catalog['id']) == sid
+    if not np.any(mask):
+        return None
+    if sid not in parent.segmap_local:
+        return None
+    footprint = parent.segmap_local[sid]
+    return _Group(
+        group_id=int(sid),
+        band_data=parent.band_data,
+        detection_band=parent.detection_band,
+        msk=parent.msk,
+        catalog_subset=parent.catalog[mask],
+        segmap_local={int(sid): footprint},
+        groupmap_local={int(sid): footprint},
+        wcs=parent.wcs,
+        pixel_scales=parent.pixel_scales,
+        config=parent.config,
+        origin=parent.origin,
+    )
+
+
+def _fit_singletons(parent, timeout):
+    """Retry each source in ``parent`` as an independent single-source fit.
+
+    Each singleton gets its own fresh ``timeout`` budget. Returns
+    ``(models, trackers)`` dicts keyed by source_id for sources that produced
+    a usable model (``hasattr(model, 'pos')``). Sources whose singleton fit
+    fails are omitted so the caller can keep the parent's partial result.
+    """
+    models = OrderedDict()
+    trackers = {}
+    for sid in parent.source_ids:
+        sid = int(sid)
+        single = _make_singleton_group(parent, sid)
+        if single is None:
+            continue
+        tstart = time.time()
+        deadline = (tstart + timeout) if timeout is not None else None
+        try:
+            ok = single.determine_models(deadline=deadline)
+            if ok and (deadline is None or time.time() <= deadline):
+                single.force_models(deadline=deadline)
+        except Exception:
+            continue
+        m = single.model_catalog.get(sid)
+        if m is not None and hasattr(m, 'pos'):
+            m.group_id = parent.group_id
+            models[sid] = m
+        if sid in single.model_tracker:
+            trackers[sid] = single.model_tracker[sid]
+    return models, trackers
+
 
 def _process_group(group, timeout=None):
     """Determine models + force photometry for a group; return serialisable result.
@@ -1114,29 +1305,63 @@ def _process_group(group, timeout=None):
     mid-optimisation, the group returns its current best result (the last
     fully-completed model-selection stage) rather than being dropped.
     Sources in a timed-out group are flagged with ``FLAG_TIMEOUT`` (0x0200).
+
+    When ``config.singleton_fallback`` is True and a multi-source group
+    times out, each source is re-fit in isolation with a fresh ``timeout``
+    budget (using its own segmap as the fit footprint). Successfully re-fit
+    sources additionally carry ``FLAG_SINGLETON_FALLBACK`` (0x0400).
     """
     tstart = time.time()
     deadline = (tstart + timeout) if timeout is not None else None
     timed_out = False
+    pre_solved = None
     if not group.rejected:
+        if (getattr(group.config, 'dominant_prefit', True)
+                and len(group.source_ids) > 1):
+            dom_sid = _find_dominant_source(
+                group,
+                getattr(group.config, 'dominant_npix_ratio', 3.0),
+                getattr(group.config, 'dominant_npix_min', 500),
+            )
+            if dom_sid is not None:
+                dom_model = _prefit_dominant(group, dom_sid, deadline=deadline)
+                if dom_model is not None:
+                    pre_solved = {dom_sid: dom_model}
+                    group.logger.debug(
+                        f'Dominant-prefit: sid={dom_sid} model={type(dom_model).__name__}')
         try:
-            ok = group.determine_models(deadline=deadline)
+            ok = group.determine_models(deadline=deadline, pre_solved=pre_solved)
             if deadline is not None and time.time() > deadline:
                 timed_out = True
             if ok:
-                group.force_models()
+                group.force_models(pre_solved=pre_solved)
         except Exception:
             pass
         if deadline is not None and time.time() > deadline:
             timed_out = True
+
+    singleton_sids = set()
+    if (timed_out
+            and getattr(group.config, 'singleton_fallback', True)
+            and len(group.source_ids) > 1):
+        models, trackers = _fit_singletons(group, timeout)
+        for sid, m in models.items():
+            group.model_catalog[sid] = m
+        for sid, tr in trackers.items():
+            group.model_tracker[sid] = tr
+        singleton_sids = set(models.keys())
+
     elapsed = time.time() - tstart
     for sid in group.source_ids:
+        sid_int = int(sid)
         if sid in group.model_tracker:
             stages = [k for k in group.model_tracker[sid] if isinstance(k, int)]
             if stages:
                 group.model_tracker[sid][max(stages)]['group_time'] = elapsed
                 if timed_out:
                     group.model_tracker[sid][max(stages)]['timed_out'] = True
+                if sid_int in singleton_sids:
+                    group.model_tracker[sid][max(stages)]['singleton_fallback'] = True
     return group.group_id, group.model_catalog.copy(), group.model_tracker.copy()
 
 

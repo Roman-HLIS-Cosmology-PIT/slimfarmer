@@ -105,14 +105,14 @@ cat = slimfarmer.run_photometry(
 | `dominant_prefit` | `True` | Solo-fit a group's dominant source first, then run the joint fit with it frozen (prevents neighbor flux stealing) |
 | `dominant_npix_ratio` | `3.0` | Dominant qualification: `npix_dominant` must exceed `ratio × 2nd_largest_npix` |
 | `dominant_npix_min` | `500` | Absolute minimum `npix` for dominant qualification |
-| `singleton_fallback` | `True` | On timeout, retry each source as an independent one-source fit in a fresh pool |
+| `singleton_fallback` | `True` | On timeout, retry each source as an independent one-source fit. Each singleton runs in its own `mp.Process` with a per-source wall-clock limit of `stuck_ceiling`; any singleton still alive at that deadline is killed (SIGTERM → SIGKILL) and flagged `FLAG_TIMEOUT` only (no `FLAG_SINGLETON_FALLBACK`). A rolling window keeps up to `ncpus` singletons running concurrently — as soon as one finishes or is killed, the next queued source starts, so no core is ever idle waiting on a laggard |
 | `neighbor_subtraction` | `False` | Two-pass mode that subtracts neighbor models |
 | `neighbor_radius` | `5.0"` | Radius for neighbor subtraction |
 | `noshot` | `False` | If True, use background-only weights for kappa |
 | `ncpus` | `0` | Worker processes (`0` = serial) |
 | `paddingpixel` | `34` | Boundary padding for flagging edge sources |
-| `timeout` | `1200` | Per-group wall-clock limit (seconds). Groups that exceed this return their best-so-far model and are flagged `0x0200` |
-| `stuck_ceiling` | `600` | Hard wall-clock ceiling (seconds). When a worker hangs inside a C extension and ignores the cooperative `timeout`, the parent abandons the task after this many seconds and — if `singleton_fallback` is on — retries each of the stuck group's sources as a singleton |
+| `timeout` | `1800` | Per-group wall-clock limit (seconds). Groups that exceed this return their best-so-far model and are flagged `0x0200` |
+| `stuck_ceiling` | `1800` | Hard wall-clock ceiling (seconds). When a worker hangs inside a C extension and ignores the cooperative `timeout`, the parent abandons the task after this many seconds and — if `singleton_fallback` is on — retries each of the stuck group's sources as a singleton |
 | `roman_pixel_scale_arcsec` | `0.049` | Canonical IMCOM pixel scale; used when overlaying Roman-derived shapes on other images |
 | `save_model_image` | `True` | Write `<output>_model.fits` and `<output>_residual.fits` |
 

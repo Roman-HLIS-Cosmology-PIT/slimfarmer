@@ -26,15 +26,18 @@ class Config:
     group_buffer = 0.01 * u.arcsec
     group_size_limit = 100
     fit_dilation_radius = 0.2 * u.arcsec  # expand fitting region beyond groupmap to capture profile wings
-    timeout=1000
+    timeout=1200
     # Hard wall-clock ceiling per task (seconds). When a worker hangs inside a
     # C extension and ignores the cooperative `timeout` deadline, the parent
     # gives up on that task after this many seconds and moves on.
-    stuck_ceiling = 600
+    stuck_ceiling = 1800
     paddingpixel = 34
     # When a group hits the timeout, retry each source as an independent
-    # single-source fit. Disable to keep the old behavior of accepting the
-    # partial joint-fit result from the last completed stage.
+    # single-source fit. Each singleton runs in its own ``mp.Process`` with a
+    # per-source wall-clock limit of ``stuck_ceiling``; any singleton still
+    # alive at that deadline is killed (SIGTERM → SIGKILL) and flagged
+    # ``FLAG_TIMEOUT`` only (no ``FLAG_SINGLETON_FALLBACK``). Disable to keep
+    # the old behavior of accepting the partial joint-fit result.
     singleton_fallback = True
     # Dominant-source prefit: if a group contains one source whose SEP segmap
     # is much larger than any sibling's, solo-fit that source first, then run

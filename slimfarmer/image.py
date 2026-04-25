@@ -6,6 +6,7 @@ Detection → grouping → model selection (detection band) → forced photometr
 
 import logging
 import sys
+import time
 import numpy as np
 import sep
 
@@ -37,6 +38,24 @@ from .flags import FLAG_BOUNDARY, FLAG_TIMEOUT, FLAG_SINGLETON_FALLBACK
 
 def _sys_byteorder():
     return '>' if sys.byteorder == 'big' else '<'
+
+
+def _singleton_worker(singleton_group, timeout, result_queue):
+    """Run ``_process_group`` on a one-source group and push the result.
+
+    Run as a top-level target of :class:`multiprocessing.Process` so the
+    parent can kill an individual hung singleton with ``p.terminate()``
+    without losing the others. Pushes the ``_process_group`` return value
+    (tuple) on success or ``None`` on exception.
+    """
+    try:
+        result = _process_group(singleton_group, timeout=timeout)
+    except Exception:
+        result = None
+    try:
+        result_queue.put(result)
+    except Exception:
+        pass
 
 
 class FarmerImage:
@@ -532,47 +551,74 @@ class FarmerImage:
                         if s is not None:
                             singletons.append((s, int(gid), int(sid)))
                 if singletons:
+                    ncpus_eff = max(1, int(self.config.ncpus) or 1)
                     self.logger.info(
                         f'Retrying {len(singletons)} sources from {len(stuck_gids)} '
-                        f'stuck group(s) as singletons...')
-                    pool2 = mp.Pool(processes=self.config.ncpus, maxtasksperchild=5)
-                    try:
-                        async2 = [pool2.apply_async(_process_group, (s, timeout))
-                                  for s, _, _ in singletons]
-                        pool2.close()
-                        n_saved = 0
-                        pbar2 = _tqdm.tqdm(total=len(async2), desc='Singletons')
-                        for (_, parent_gid, sid), ar in zip(singletons, async2):
-                            try:
-                                result = ar.get(timeout=stuck_ceiling)
-                            except mp.TimeoutError:
+                        f'stuck group(s) as singletons '
+                        f'(per-source ceiling {stuck_ceiling}s, up to {ncpus_eff} in flight)...')
+                    n_saved = 0
+                    n_killed = 0
+                    t_fallback_start = time.time()
+                    pbar2 = _tqdm.tqdm(total=len(singletons), desc='Singletons')
+                    # Rolling window: keep up to ncpus processes running at
+                    # any time. Whenever one finishes (normally or via kill),
+                    # immediately start the next queued singleton. Each
+                    # singleton has its own per-source deadline; Process.
+                    # terminate() kills Ceres-bound C code too.
+                    active = []  # list of (process, queue, parent_gid, sid, t_start)
+                    idx = 0
+                    while idx < len(singletons) or active:
+                        # Fill up to ncpus
+                        while len(active) < ncpus_eff and idx < len(singletons):
+                            s, parent_gid, sid = singletons[idx]
+                            q = mp.Queue()
+                            p = mp.Process(target=_singleton_worker,
+                                           args=(s, timeout, q))
+                            p.start()
+                            active.append((p, q, parent_gid, sid, time.time()))
+                            idx += 1
+                        # Reap any finished or timed-out entries
+                        now = time.time()
+                        for entry in list(active):
+                            p, q, parent_gid, sid, tstart = entry
+                            if not p.is_alive():
+                                active.remove(entry)
+                                try:
+                                    result = q.get_nowait()
+                                except Exception:
+                                    result = None
+                                if result is None:
+                                    pbar2.update(1)
+                                    continue
+                                self._absorb(result)
+                                if sid in self.model_catalog:
+                                    self.model_catalog[sid].group_id = parent_gid
+                                if sid in self.model_tracker:
+                                    stages = [k for k in self.model_tracker[sid]
+                                              if isinstance(k, int)]
+                                    if stages:
+                                        last = self.model_tracker[sid][max(stages)]
+                                        last['singleton_fallback'] = True
+                                        last['timed_out'] = True
+                                n_saved += 1
                                 pbar2.update(1)
-                                continue
-                            except Exception:
+                            elif now - tstart > stuck_ceiling:
+                                p.terminate()
+                                p.join(timeout=5)
+                                if p.is_alive():
+                                    p.kill()
+                                    p.join(timeout=5)
+                                active.remove(entry)
+                                n_killed += 1
                                 pbar2.update(1)
-                                continue
-                            self._absorb(result)
-                            # Re-attribute to the original parent group.
-                            if sid in self.model_catalog:
-                                self.model_catalog[sid].group_id = parent_gid
-                            # Mark tracker so build_catalog sets both
-                            # FLAG_TIMEOUT and FLAG_SINGLETON_FALLBACK.
-                            if sid in self.model_tracker:
-                                stages = [k for k in self.model_tracker[sid]
-                                          if isinstance(k, int)]
-                                if stages:
-                                    last = self.model_tracker[sid][max(stages)]
-                                    last['singleton_fallback'] = True
-                                    last['timed_out'] = True
-                            n_saved += 1
-                            pbar2.update(1)
-                        pbar2.close()
-                        self.logger.info(
-                            f'Singleton fallback recovered {n_saved}/'
-                            f'{len(async2)} sources.')
-                    finally:
-                        pool2.terminate()
-                        pool2.join()
+                        if active:
+                            time.sleep(0.5)
+                    pbar2.close()
+                    self.logger.info(
+                        f'Singleton fallback recovered {n_saved}/'
+                        f'{len(singletons)} sources '
+                        f'({n_killed} killed on per-source ceiling, '
+                        f'elapsed {time.time()-t_fallback_start:.0f}s).')
             for band in self.band_config:
                 for key, val in saved[band].items():
                     if val is not None:

@@ -659,8 +659,8 @@ class FarmerImage:
 
     # ── Post-fit correlated-noise kappa ─────────────────────────────────────
 
-    # Crossover: N² < Npix·log2(Npix) ⟹ sparse wins. For a 2354² image
-    # that's N < ~sqrt(2354² · 21) ≈ 10800. We use a conservative 3000
+    # Crossover: N^2 < Npix·log2(Npix) ⟹ sparse wins. For a 2354^2 image
+    # that's N < ~sqrt(2354^2 · 21) ≈ 10800. We use a conservative 3000
     # so the sparse path stays comfortably fast even with the Python loop.
     _KAPPA_SPARSE_CUTOFF = 3000
 
@@ -703,7 +703,7 @@ class FarmerImage:
     def compute_kappa(self):
         """Compute kappa using cached h data.
 
-        Uses a hybrid strategy per source: sparse O(N²) double-sum for
+        Uses a hybrid strategy per source: sparse O(N^2) double-sum for
         small groups (N < ``_KAPPA_SPARSE_CUTOFF``), FFT convolution for
         large groups. Parallelised over sources via ThreadPoolExecutor
         when ``config.ncpus > 0``.

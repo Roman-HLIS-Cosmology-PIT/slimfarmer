@@ -1,6 +1,6 @@
 # slimfarmer
 
-![slimfarmer logo](doc/logo.png)
+<img src="doc/logo.png" alt="slimfarmer logo" width="300">
 
 A streamlined multi-band photometry pipeline that uses **SEP** for source detection and **Tractor** for galaxy model fitting, with correlated-noise corrections derived from noise realizations. Designed for Roman IMCOM coadds and inspired by [The Farmer](https://github.com/astroweaver/the_farmer) (Weaver et al. 2023).
 

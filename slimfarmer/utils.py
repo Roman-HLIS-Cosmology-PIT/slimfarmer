@@ -16,8 +16,10 @@ from astrometry.util.util import Tan
 from tractor import ConstantFitsWcs
 from astropy.wcs import WCS
 from astropy.nddata import Cutout2D
+from pyimcom.analysis import OutImage
 
 from .flags import FLAG_BOUNDARY
+import fitsio
 
 
 
@@ -214,6 +216,10 @@ def set_priors(model, priors):
                     reff_current = max(np.exp(logre_val), 1e-3)
                     sigma_logre = sigma_arcsec / reff_current
                     model[idx].addGaussianPrior('logre', mu=logre_val, sigma=sigma_logre)
+        elif name == 'brightness':
+            flux_rule = priors.get('brightness_low', None)
+            if flux_rule != None:
+                model[idx].lowers = [float(flux_rule)] * len(model[idx].vals)
     return model
 
 
@@ -400,6 +406,7 @@ def prepare_images_from_cpr(cpr_path, work_dir,
     try:
         from pyimcom.compress.compressutils import ReadFile
         from pyimcom.diagnostics.outimage_utils.helper import HDU_to_bels
+        from pyimcom.analysis import OutImage
     except ImportError as e:
         raise ImportError(
             'pyimcom is required to read CPR files. '
@@ -410,28 +417,32 @@ def prepare_images_from_cpr(cpr_path, work_dir,
 
 
     # ── Read CPR ──────────────────────────────────────────────────────────────
-    cpr    = ReadFile(cpr_path)
+    outimage    = OutImage(cpr_path)
     if truth:
-        sci    = cpr[0].data[0][1].astype(np.float32)
+        sci = outimage.get_coadded_layer("truth,0.004906087669824225").astype(np.float32)   #= cpr[0].data[0][1].astype(np.float32)
     elif realization:
-        sci    = cpr[0].data[0][1].astype(np.float32)+cpr[0].data[0][26].astype(np.float32)
+        sci    = outimage.get_coadded_layer("truth,0.004906087669824225").astype(np.float32)+outimage.get_coadded_layer("noise,Rz4OS2C7").astype(np.float32) 
+        #cpr[0].data[0][1].astype(np.float32)+cpr[0].data[0][26].astype(np.float32)
     else:
-        sci    = cpr[0].data[0][0].astype(np.float32)
-    header = cpr[0].header
+        sci    = outimage.get_coadded_layer("SCI").astype(np.float32) 
+        #cpr[0].data[0][0].astype(np.float32)
+    header = outimage.header
 
     pix_scale = abs(header['CDELT2']) * 3600.  # arcsec/px
 
     # ── Variance map ──────────────────────────────────────────────────────────
-    Sigma       = 10 ** (HDU_to_bels(cpr[6]) * cpr[6].data[0])
-    Neff        = 10 ** (HDU_to_bels(cpr[8]) * cpr[8].data[0])
-    scalefactor = np.sum(cpr[0].data[0][21] ** 2)
+    Sigma       = outimage.get_output_map("SIGMA") #10 ** (-1*HDU_to_bels(cpr[6]) * cpr[6].data[0])
+    Neff        = outimage.get_output_map("EFFCOVER")  #10 ** (HDU_to_bels(cpr[8]) * cpr[8].data[0])
+    noise_image = outimage.get_coadded_layer("noise,Rz4PbrS2C2")
+    scalefactor =  np.sum(np.square(noise_image))   #np.sum(cpr[0].data[0][21] ** 2)
 
     factor      = gain / (pix_size / pix_scale) ** 2
     sci         = sci * factor
 
     # ── Noise realizations (layers 20-23) ────────────────────────────────
     noise_reals = np.stack(
-        [cpr[0].data[0][k].astype(np.float32) for k in range(24, 28)]
+        #[cpr[0].data[0][k].astype(np.float32) for k in range(24, 28)]
+        [outimage.get_coadded_layer(_noise).astype(np.float32) for _noise in ['noise,Rz4OS2C5','noise,Rz4OS2C6','noise,Rz4OS2C7','noise,Rz4OS2C8']]
     ) * factor  # (4, Ny, Nx)
 
     # Background-only (correlated) variance — source shot noise excluded.
@@ -909,7 +920,7 @@ def match_spatial_mag(cat_ra, cat_dec, cat_mags,
     cat_mags : array, shape (N_cat,) or (N_cat, N_bands) — detected magnitudes.
     truth_ra, truth_dec : arrays — truth catalogue coordinates (degrees).
     truth_mags : array, shape (N_truth,) or (N_truth, N_bands) — truth magnitudes.
-    radius_arcsec : float — spatial search radius (default 0.6", ~3 Roman px).
+    radius_arcsec : float — spatial search radius (default 0.6", ~3 Rubin px).
     mag_thresh : float — maximum allowed magnitude distance (default 1.0).
 
     Returns
